@@ -1,0 +1,28 @@
+name: Auto Commit
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'   # 6시간마다 실행
+  workflow_dispatch:        # 수동 실행도 가능
+
+jobs:
+  auto-commit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Setup Git
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Make changes
+        run: |
+          echo "$(date)" >> auto_commit_log.txt
+
+      - name: Commit and push
+        run: |
+          git add .
+          git commit -m "chore: auto commit"
+          git push
