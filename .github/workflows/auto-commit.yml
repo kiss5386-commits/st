@@ -1,25 +1,28 @@
-name: Auto Commit (via PR)
+name: Auto Commit (via PR + Auto-merge)
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch: {}     # 수동 실행 (원하면 schedule 추가 가능)
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: write           # 파일 변경 커밋
+  pull-requests: write      # PR 생성/자동머지
 
 jobs:
   pr:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Append timestamp
+      - name: Append timestamp (always changes)
         shell: bash
         run: |
           echo "Last run: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> last_run.txt
 
+      # PR 생성
       - name: Create Pull Request
+        id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
           commit-message: "chore: auto-commit (timestamp)"
@@ -27,4 +30,13 @@ jobs:
           body: "자동 생성된 PR입니다."
           branch: auto/last-run
           base: ${{ github.event.repository.default_branch }}
-          delete-branch: true
+          delete-branch: true           # 머지 후 작업브랜치 삭제
+
+      # 자동 머지 활성화 (PR이 새로 생성됐을 때)
+      - name: Enable auto-merge
+        if: steps.cpr.outputs.pull-request-operation == 'created'
+        uses: peter-evans/enable-pull-request-automerge@v3
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+          merge-method: squash          # 원하면 merge|rebase로 변경 가능
