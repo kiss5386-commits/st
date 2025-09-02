@@ -1,0 +1,127 @@
+name: apply-trailing-reverse-patch
+on:
+  workflow_dispatch: {}   # Actions 탭에서 수동 실행
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Apply trailing-reverse patch
+        run: |
+          python - <<'PY'
+          import io, os, re, sys, textwrap, pathlib
+
+          p = pathlib.Path("stargate_all_in_one.py")
+          s = p.read_text(encoding="utf-8")
+
+          changed = False
+
+          def ensure_trailing_enabled_var(src):
+            """
+            파일 어딘가에 trailing_enabled 계산이 없으면,
+            신호 처리부에서도 재사용 가능하도록 안전한 헬퍼를 주입합니다.
+            """
+            if "def _as_bool(" in src and "def trailing_enabled_from_cfg(" in src:
+                return src, False
+
+            inject = textwrap.dedent("""
+            # === GPT PATCH HELPER: BEGIN ===
+            def _as_bool(v, default=True):
+                if v is None:
+                    return default
+                if isinstance(v, bool):
+                    return v
+                return str(v).strip().lower() in ("1","true","yes","y","on")
+            def trailing_enabled_from_cfg(cfg):
+                try:
+                    # 다양한 키명을 허용 (enable_trailing / trailing_enabled / trailing.enabled)
+                    if isinstance(cfg, dict):
+                        if "enable_trailing" in cfg:
+                            return _as_bool(cfg.get("enable_trailing"), True)
+                        if "trailing_enabled" in cfg:
+                            return _as_bool(cfg.get("trailing_enabled"), True)
+                        t = cfg.get("trailing") or {}
+                        if isinstance(t, dict) and "enabled" in t:
+                            return _as_bool(t.get("enabled"), True)
+                    # fallback
+                    return True
+                except Exception:
+                    return True
+            # === GPT PATCH HELPER: END ===
+            """).strip()+"\n\n"
+            # 헬퍼는 import 블록 아래에만 한 번 삽입
+            m = re.search(r"(?s)^(from .*?\\n|import .*?\\n)+", src)
+            if m:
+                pos = m.end()
+            else:
+                pos = 0
+            return src[:pos] + inject + src[pos:], True
+
+          s, inj = ensure_trailing_enabled_var(s)
+          changed = changed or inj
+
+          # 1) reverse_on_opposite 변수 정의를 '트레일링이 꺼져 있으면 True'로 강제
+          #    (해당 변수가 이미 있다면 치환, 없으면 신호 처리 직전 합리적 위치에 삽입)
+          # 우선 치환을 시도
+          new_s, n = re.subn(
+              r"(?m)^(\s*)reverse_on_opposite\s*=\s*.*$",
+              r"\1reverse_on_opposite = (not trailing_enabled_from_cfg(cfg))",
+              s,
+          )
+          if n > 0:
+              s = new_s
+              changed = True
+          else:
+              # 신호 처리 구간을 찾아서 변수 선언을 주입 (여러 패턴 지원)
+              # 패턴 1: process_signal(...) 같은 함수 헤더 직후
+              patterns = [
+                  r"(?m)^def\s+process_?signal\(.*?\):\s*\n",
+                  r"(?m)^def\s+handle_?webhook\(.*?\):\s*\n",
+                  r"(?m)^@app\.route\('/webhook'.*?\)\s*\ndef\s+\w+\(.*?\):\s*\n",
+              ]
+              inserted = False
+              for pat in patterns:
+                  m = re.search(pat, s)
+                  if m:
+                      insert_at = m.end()
+                      insert = "    reverse_on_opposite = (not trailing_enabled_from_cfg(cfg))  # GPT PATCH: trailing off => reverse\n"
+                      s = s[:insert_at] + insert + s[insert_at:]
+                      changed = True
+                      inserted = True
+                      break
+
+              if not inserted:
+                  # 최후 수단: 파일 끝에 안전한 가드와 함께 선언(런타임에 재정의되어도 무해)
+                  s += "\n# GPT PATCH: fallback definition\nreverse_on_opposite = (not trailing_enabled_from_cfg(globals().get('cfg', {})))\n"
+                  changed = True
+
+          # 2) 로그 문구(선택): trailing ON이면 전환 무시, OFF면 전환 수행
+          # (이미 상세 로직이 있다면 그대로 사용하되, 안내 로그가 없으면 주입)
+          if "trailing on → ignore opposite-signal reverse" not in s:
+              s = s.replace(
+                  "ignore opposite",
+                  "trailing on → ignore opposite-signal reverse"
+              )
+
+          if changed:
+              p.write_text(s, encoding="utf-8")
+          else:
+              print("No changes applied; pattern not found (safe).")
+          PY
+
+      - name: Create PR
+        uses: peter-evans/create-pull-request@v6
+        with:
+          branch: patch/trailing-reverse
+          commit-message: "server: reverse on opposite when trailing is disabled"
+          title: "patch: 반대신호 전환을 '트레일링 OFF' 조건으로 변경"
+          body: |
+            - 트레일링이 꺼져 있으면 반대 신호에서 기존 포지션 정리 후 즉시 반대 포지션 진입
+            - 손절 체크 여부와 무관하게 동작
+            - 헬퍼 추가: `_as_bool`, `trailing_enabled_from_cfg`
