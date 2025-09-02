@@ -1,0 +1,1 @@
+{   plan: rename-check-to-readme,   files: [     {       path: server/_pipeline_smoke/README_SMOKE.md,       action: create,       content: #PipelineSmokennThisfilewascreatedbygpt_patcher.n,       reason: check.txt를README로교체     },     { path: server/_pipeline_smoke/check.txt, action: delete, reason: 대체됨 }   ],   summary: renamedcheck.txt-
