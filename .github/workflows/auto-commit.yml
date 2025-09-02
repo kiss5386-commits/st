@@ -77,12 +77,21 @@ jobs:
           def sanitize_patch(patch: str) -> str:
               """
               LLM 출력에서 순수 git unified diff만 추출하여 정리
-              - 코드펜스 제거
-              - CRLF를 LF로 통일
-              - diff --git 이전의 모든 설명 텍스트 제거
-              - 공백 정리 및 마지막 개행 보장
+              - 코드펜스 제거 (```diff / ```python / ``` 등)
+              - CRLF -> LF 통일
+              - 첫 diff --git 이전 텍스트 제거
+              - 마지막 개행 보장
               """
               print("Sanitizing patch output...")
+              s = patch.replace("\r\n","\n").replace("\r","\n")
+              s = re.sub(r'^```[a-zA-Z0-9_-]*\s*\n', '', s, flags=re.M)  # 여는 fence 제거
+              s = re.sub(r'\n?```$', '', s.strip(), flags=0)             # 닫는 fence 제거
+              m = re.search(r'^diff --git a/.*', s, flags=re.M)
+              if m: s = s[m.start():]
+              s = s.strip() + "\n"
+              print(f"Patch sanitized, size: {len(s)} characters")
+              return s
+
               
               # CRLF를 LF로 통일
               patch = patch.replace('\r\n', '\n').replace('\r', '\n')
@@ -111,20 +120,19 @@ jobs:
           def _paths_from_patch(patch: str) -> list[str]:
               """
               패치에서 대상 파일 경로들을 추출
-              +++ b/path 및 --- a/path 형식에서 경로 수집 (/dev/null 제외)
+              +++ b/path 및 --- a/path 헤더에서 'a/' 또는 'b/' 다음의 **전체 경로**를 수집 (/dev/null 제외)
               """
               print("Extracting file paths from patch...")
               paths = []
-              
-              for line in patch.split('\n'):
-                  # +++ b/경로 또는 --- a/경로 형식 찾기
-                  if line.startswith('+++ b/') or line.startswith('--- a/'):
-                      path = line.split('/', 2)[-1] if '/' in line else ''
-                      if path and path != 'dev/null' and path not in paths:
+              for line in patch.splitlines():
+                  if line.startswith("+++ b/") or line.startswith("--- a/"):
+                      hdr = line.split("\t")[0]                 # 탭 앞까지만
+                      path = hdr.split(" ", 1)[-1][2:]          # 'a/' 또는 'b/' 제거 후 전체 경로
+                      if path and path != "/dev/null" and path not in paths:
                           paths.append(path)
-              
               print(f"Found {len(paths)} file paths: {paths}")
               return paths
+
           
           def ensure_dirs_for_patch(patch: str):
               """
