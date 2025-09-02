@@ -24,7 +24,6 @@ jobs:
   pr:
     runs-on: ubuntu-latest
     env:
-      # 🔑 여기서 OpenAI 키를 가져옵니다. (이미 Secrets에 넣으셨음)
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
@@ -47,8 +46,8 @@ jobs:
         shell: bash
         run: |
           cat > "$RUNNER_TEMP/gpt_patcher.py" <<'PY'
-          # (여기에 원래 gpt_patcher.py 코드 내용 그대로 붙여넣기)
-          PY
+          import os, re, subprocess, sys, pathlib
+          from openai import OpenAI
 
           # 수정 허용/차단 경로 (안전장치)
           SAFE_PATHS = ["app", "server", "configs", "stargate_all_in_one.py"]
@@ -132,7 +131,6 @@ jobs:
         run: |
           python "$RUNNER_TEMP/gpt_patcher.py"
 
-      # 여기서 변경된 파일들이 워킹디렉토리에 존재 → 아래 액션이 PR을 생성해줍니다.
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v6
