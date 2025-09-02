@@ -1,3 +1,27 @@
+# === GPT PATCH HELPER: BEGIN ===
+def _as_bool(v, default=True):
+    if v is None:
+        return default
+    if isinstance(v, bool):
+        return v
+    return str(v).strip().lower() in ("1","true","yes","y","on")
+def trailing_enabled_from_cfg(cfg):
+    try:
+        # 다양한 키명을 허용 (enable_trailing / trailing_enabled / trailing.enabled)
+        if isinstance(cfg, dict):
+            if "enable_trailing" in cfg:
+                return _as_bool(cfg.get("enable_trailing"), True)
+            if "trailing_enabled" in cfg:
+                return _as_bool(cfg.get("trailing_enabled"), True)
+            t = cfg.get("trailing") or {}
+            if isinstance(t, dict) and "enabled" in t:
+                return _as_bool(t.get("enabled"), True)
+        # fallback
+        return True
+    except Exception:
+        return True
+# === GPT PATCH HELPER: END ===
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -5415,3 +5439,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+# GPT PATCH: fallback definition
+reverse_on_opposite = (not trailing_enabled_from_cfg(globals().get('cfg', {})))
