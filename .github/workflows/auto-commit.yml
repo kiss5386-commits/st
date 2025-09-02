@@ -49,7 +49,8 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install openai>=1.0.0 pyyaml requests pathlib typing-extensions
+        pip install "openai>=1.0.0,<2" "PyYAML>=6.0,<7"
+
     
     - name: Configure Git
       run: |
@@ -62,6 +63,10 @@ jobs:
         git add -A
         git stash push -m "Backup before GPT modification - $(date)"
         echo "🔒 현재 상태 백업 완료"
+
+    - name: Python syntax check
+      run: python -m py_compile gpt_patcher.py
+
     
     - name: Execute GPT Patcher
       env:
@@ -72,7 +77,10 @@ jobs:
         GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
         echo "🚀 GPT 패처 실행 시작"
-        echo "📝 지시문: $USER_INSTRUCTIONS"
+        echo "📝 지시문(앞 120자):"
+        printf '%s' "$USER_INSTRUCTIONS" | head -c 120 | sed 's/`/´/g'
+        echo
+
         echo "🤖 모델: $OPENAI_MODEL"
         echo "📂 최대 파일: $MAX_FILES"
         
@@ -110,11 +118,10 @@ jobs:
       run: |
         git add -A
         
-        # 커밋 메시지 생성
-        COMMIT_MSG="🤖 GPT 자동 수정: ${{ github.event.inputs.instructions }}"
-        
-        # 커밋 실행
-        git commit -m "$COMMIT_MSG" -m "Run ID: ${{ github.run_id }}" -m "Model: ${{ github.event.inputs.model }}"
+        COMMIT_MSG_RAW="${{ github.event.inputs.instructions }}"
+        COMMIT_MSG_SAFE=$(printf '%s' "$COMMIT_MSG_RAW" | tr '\n' ' ' | sed 's/`/´/g')
+        git commit -m "🤖 GPT 자동 수정: ${COMMIT_MSG_SAFE}" -m "Run ID: ${{ github.run_id }}" -m "Model: ${{ github.event.inputs.model }}"
+
         
         echo "✅ 변경사항 커밋 완료"
     
@@ -197,7 +204,10 @@ jobs:
       run: |
         echo "📊 GPT 자동 수정 요약"
         echo "===================="
-        echo "📝 지시문: ${{ github.event.inputs.instructions }}"
+        echo "📝 지시문(앞 120자):"
+        printf '%s' "${{ github.event.inputs.instructions }}" | head -c 120 | sed 's/`/´/g'
+        echo
+
         echo "🤖 모델: ${{ github.event.inputs.model }}"
         echo "📂 최대 파일: ${{ github.event.inputs.max_files }}"
         echo "🔄 Run ID: ${{ github.run_id }}"
