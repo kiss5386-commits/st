@@ -37,15 +37,21 @@ import math
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from dataclasses import dataclass, asdict, field
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple, List
+from typing import Any, Dict, Optional, Tuple, List, Iterable
 from abc import ABC, abstractmethod
 
-# GUI
-import tkinter as tk
-from tkinter import ttk, messagebox
+# GUI (optional in headless environments)
+GUI_AVAILABLE = False
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox
+    GUI_AVAILABLE = True
+except Exception:
+    tk = ttk = messagebox = None  # headless-safe
 
 # Web server
 from flask import Flask, request, jsonify
+import argparse
 
 # HTTP
 import requests
@@ -1237,17 +1243,25 @@ class BybitExchange(ExchangeBase):
             )
             if data.get("retCode") == 0 and data.get("result", {}).get("list"):
                 info = data["result"]["list"][0]
-                lot_filter = info.get("lotSizeFilter", {})
-                price_filter = info.get("priceFilter", {})
+                lot_filter = info.get("lotSizeFilter", {}) or {}
+                price_filter = info.get("priceFilter", {}) or {}
+
+                # Normalize filter fields with safe fallbacks across product types
+                qty_step = lot_filter.get("qtyStep") or lot_filter.get("stepSize") or "0.001"
+                min_qty  = lot_filter.get("minOrderQty") or lot_filter.get("minQty") or "0.001"
+                min_notional = (lot_filter.get("minNotional")
+                                or lot_filter.get("minOrderAmt")
+                                or lot_filter.get("minValue")
+                                or "5")
 
                 contract = ContractInfo(
                     symbol=symbol,
                     base_currency=info.get("baseCoin", ""),
                     quote_currency=info.get("quoteCoin", "USDT"),
-                    tick_size=float(price_filter.get("tickSize", "0.01") or "0.01"),
-                    step_size=float(lot_filter.get("qtyStep", "0.001") or "0.001"),
-                    min_qty=float(lot_filter.get("minOrderQty", "0.001") or "0.001"),
-                    min_notional=float(lot_filter.get("minNotional", "5") or "5"),
+                    tick_size=float(price_filter.get("tickSize") or "0.01"),
+                    step_size=float(qty_step),
+                    min_qty=float(min_qty),
+                    min_notional=float(min_notional),
                 )
                 self._contract_cache[symbol] = contract
                 return contract
@@ -5336,6 +5350,7 @@ class StargateMultiExchangeGUI:
 # ============================================================================
 
 
+
 def main():
     """메인 진입점"""
     mp.set_start_method("spawn", force=True)
@@ -5343,17 +5358,45 @@ def main():
     try:
         # 기본 로깅 설정
         logging.basicConfig(level=logging.INFO, format=LOG_FORMAT, datefmt=DATE_FORMAT)
-
         logger = logging.getLogger("stargate.main")
-        logger.info("Stargate Multi-Exchange Trading Server v4.2")
+
+        # ---- CLI ----
+        parser = argparse.ArgumentParser(
+            prog="stargate",
+            description="Stargate Multi-Exchange Trading Server v4.2.1"
+        )
+        parser.add_argument("--server-only", action="store_true",
+                            help="GUI 없이 Flask 서버만 실행")
+        parser.add_argument("--host", default=None, help="서버 바인딩 호스트 (기본: 설정값)")
+        parser.add_argument("--port", type=int, default=None, help="서버 포트 (기본: 설정값)")
+        parser.add_argument("--exchanges", default=None,
+                            help="쉼표로 구분된 거래소 목록 예) bybit,bitget")
+        args = parser.parse_args()
+
+        logger.info("Stargate Multi-Exchange Trading Server v4.2.1")
         logger.info("Enhanced Risk Protection System")
-        logger.info("재시도 기반 보호장치 안전 시스템")
-        logger.info("손절/트레일링 실패시 강제청산 안전장치")
-        logger.info("실시간 API 기반 Bitget 심볼 매핑 시스템")
-        logger.info("판매용 수준 안정성 및 리스크 관리 강화")
         logger.info("=" * 60)
 
-        # GUI 시작
+        # 설정 로드
+        cfg = get_config()
+        cfg_dict = cfg.to_dict() if hasattr(cfg, "to_dict") else asdict(cfg)
+
+        # CLI 덮어쓰기
+        if args.exchanges:
+            cfg_dict["SELECTED_EXCHANGES"] = [x.strip().lower() for x in args.exchanges.split(",") if x.strip()]
+        if args.host:
+            cfg_dict.setdefault("SERVER", {}).update({"host": args.host})
+        if args.port:
+            cfg_dict.setdefault("SERVER", {}).update({"port": args.port})
+
+        # 서버 전용 모드 또는 헤드리스 환경
+        if args.server_only or not GUI_AVAILABLE:
+            stop_event = mp.Event()
+            log_queue = mp.Queue()
+            server_main(cfg_dict, stop_event, log_queue)
+            return
+
+        # GUI 실행 (로컬 환경)
         gui = StargateMultiExchangeGUI()
         gui.run()
 
@@ -5367,6 +5410,7 @@ def main():
         sys.exit(1)
     finally:
         logging.info("애플리케이션 종료")
+
 
 
 if __name__ == "__main__":
