@@ -14,17 +14,22 @@ on:
                 exchanges:
                   bybit: { api_key: str!, api_secret: str!, leverage: 1..125, slippage_bps: 0..100, order_timeout_ms: 500..60000 }
                   bitget: bybit와 동일
-            - server/security/redact.py (없으면 생성): redact_secrets(obj) — api_key, api_secret, token/password 류를 "****"로 마스킹
+            - server/security/redact.py (없으면 생성): redact_secrets(obj) — api_key, api_secret, token/password 류는 "****"로 마스킹
             - server/settings.py (없으면 생성): 스키마 기반 검증, 위반 시 ValidationError
             - server/routes/settings.py (없으면 생성): PUT /settings — 실패 400 {code:"VALIDATION_ERROR", errors:[{field,msg}]}; 성공 시 키값 마스킹
-            - stargate_all_in_one.py: 기존 흐름 유지, 검증 호출 연결만 추가
+            - stargate_all_in_one.py: 기존 흐름 유지, 검증 호출 연결만 최소 추가
           안전:
             - .github, secrets, keys, certs 디렉토리 수정 금지
             - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
 
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   gpt-patch:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -38,225 +43,220 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
+        shell: bash
         run: |
+          set -e
           echo "Installing required packages..."
+          python -m pip install --upgrade pip
           pip install openai==1.* pyyaml==6.*
           echo "Dependencies installed successfully"
 
-      - name: Check worktree status
+      - name: Create GPT patcher script
+        shell: bash
         run: |
-          echo "Checking git worktree status..."
-          if [ -n "$(git status --porcelain)" ]; then
-            echo "ERROR: Worktree is dirty. Please commit or stash changes first."
-            exit 1
-          fi
-          echo "Worktree is clean, proceeding..."
+          set -e
+          echo "Creating GPT patcher script..."
+          cat > "$RUNNER_TEMP/gpt_patcher.py" << 'PY'
+          #!/usr/bin/env python3
+          import os, sys, re, subprocess, time
+          from openai import OpenAI
 
-            - name: Create GPT patcher script
-              run: |
-                echo "Creating GPT patcher script..."
-                cat > $RUNNER_TEMP/gpt_patcher.py << 'PY'
-                #!/usr/bin/env python3
-                import os, sys, re, subprocess, textwrap, time
-                from openai import OpenAI
-      
-                SAFE_PATHS = ['app', 'server', 'configs', 'stargate_all_in_one.py']
-                DENY_PATHS = ['.github', 'secrets', 'keys', 'certs']
-      
-                # -------------------- Sanitizers --------------------
-                def sanitize_patch(patch: str) -> str:
-                    """
-                    - CRLF -> LF
-                    - 코드펜스( ``` / ```diff / ```python ) 전부 제거
-                    - 첫 'diff --git a/' 이전의 텍스트 제거
-                    - 끝 공백 정리 + 마지막 개행 보장
-                    """
-                    s = patch.replace("\r\n","\n").replace("\r","\n")
-                    # 여는 fence 제거 (줄 단위)
-                    s = re.sub(r'^```[a-zA-Z0-9_-]*\s*\n', '', s, flags=re.M)
-                    # 닫는 fence 제거 (파일 끝쪽)
-                    s = re.sub(r'\n?```$', '', s.strip(), flags=0)
-                    # 첫 diff 헤더 이전 잘라내기
-                    m = re.search(r'^diff --git a/.*', s, flags=re.M)
-                    if m:
-                        s = s[m.start():]
-                    s = s.strip() + "\n"
-                    return s
-      
-                # whitelist 기반으로 "허용된 헤더/헝크/본문 라인"만 남기는 강력 모드(옵션)
-                def sanitize_strict(patch: str) -> str:
-                    allowed = (
-                        'diff --git ', 'index ', 'new file mode ', 'deleted file mode ',
-                        'similarity index ', 'rename from ', 'rename to ',
-                        '--- ', '+++ ', '@@ ', '+', '-', ' ', 'Binary files '
-                    )
-                    out = []
-                    for line in patch.splitlines():
-                        if line == '' or any(line.startswith(p) for p in allowed):
-                            out.append(line)
-                    return "\n".join(out).strip() + "\n"
-      
-                # -------------------- Path helpers --------------------
-                def _paths_from_patch(patch: str) -> list[str]:
-                    """
-                    +++ b/path, --- a/path 헤더에서 a/ 또는 b/ 다음의 전체 경로 수집 (/dev/null 제외)
-                    """
-                    paths = []
-                    for line in patch.splitlines():
-                        if line.startswith("+++ b/") or line.startswith("--- a/"):
-                            hdr = line.split("\t")[0]
-                            path = hdr.split(" ", 1)[-1][2:]   # 'a/' or 'b/' 제거
-                            if path and path != "/dev/null" and path not in paths:
-                                paths.append(path)
-                    return paths
-      
-                def ensure_dirs_for_patch(patch: str):
-                    for path in _paths_from_patch(patch):
-                        d = os.path.dirname(path)
-                        if d:
-                            os.makedirs(d, exist_ok=True)
-      
-                # -------------------- Security check --------------------
-                def validate_patch_security(patch: str) -> bool:
-                    for path in _paths_from_patch(patch):
-                        for deny in DENY_PATHS:
-                            if path == deny or path.startswith(deny + "/"):
-                                print(f"ERROR: Denied path detected: {path}", file=sys.stderr)
-                                return False
-                        ok = False
-                        for safe in SAFE_PATHS:
-                            if path == safe or path.startswith(safe + "/"):
-                                ok = True; break
-                        if not ok:
-                            print(f"ERROR: Path outside safe areas: {path}", file=sys.stderr)
-                            return False
-                    return True
-      
-                # -------------------- OpenAI call --------------------
-                SYSTEM = "Return ONLY a valid git unified diff. No code fences, no prose."
-                USER_TPL = """\
-                오직 유니파이드 패치(git apply 형식) 만 반환하세요.
-      
-                새 파일을 만드는 경우 정상 헤더를 포함해야 합니다:
-                - diff --git a/path b/path
-                - new file mode 100644
-                - --- /dev/null
-                - +++ b/path
-                - hunks @@ -0,0 +1,N @@
-      
-                제약사항:
-                - 코드·설명·마크다운 금지
-                - 허용 경로만 수정: {safe}
-                - 금지 경로 수정 절대 금지: {deny}
-                - 모호하면 TODO 주석 사용, 과한 추측 금지
-                - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
-      
-                지시문:
-                {instructions}
-                """
-      
-                def request_patch(client: OpenAI, instructions: str, extra_hint: str="") -> str:
-                    user = USER_TPL.format(
-                        safe=", ".join(SAFE_PATHS),
-                        deny=", ".join(DENY_PATHS),
-                        instructions=instructions + ("\n\n실패 힌트:\n" + extra_hint if extra_hint else "")
-                    )
-                    resp = client.chat.completions.create(
-                        model="gpt-4o-mini",
-                        messages=[
-                            {"role":"system","content": SYSTEM},
-                            {"role":"user","content": user}
-                        ],
-                        temperature=0.1,
-                        max_tokens=6000
-                    )
-                    return (resp.choices[0].message.content or "").strip()
-      
-                # -------------------- Main with retry --------------------
-                def main():
-                    if len(sys.argv) < 2:
-                        print("ERROR: No instructions provided", file=sys.stderr)
-                        sys.exit(2)
-                    instructions = sys.argv[1]
-      
-                    api_key = os.getenv("OPENAI_API_KEY")
-                    if not api_key:
-                        print("ERROR: OPENAI_API_KEY is not set", file=sys.stderr)
-                        sys.exit(2)
-                    client = OpenAI(api_key=api_key)
-      
-                    attempts = 3
-                    last_err = ""
-                    for attempt in range(1, attempts+1):
-                        print(f"[Attempt {attempt}/{attempts}] Requesting patch...")
-                        raw = request_patch(client, instructions, extra_hint=last_err)
-                        patch = sanitize_patch(raw)
-      
-                        if attempt >= 2:
-                            # 1차 실패 후엔 더 강한 정리
-                            patch = sanitize_strict(patch)
-      
-                        # 기본 헤더 확인
-                        if not re.search(r"^diff --git a/", patch, flags=re.M):
-                            last_err = "No unified diff header found after sanitize."
-                            print(last_err, file=sys.stderr)
-                            continue
-      
-                        # 보안 검사
-                        if not validate_patch_security(patch):
-                            last_err = "Patch violated security path constraints."
-                            continue
-      
-                        # 디렉토리 준비
-                        ensure_dirs_for_patch(patch)
-      
-                        # 저장 + 검증
-                        with open(".gpt_patch.diff","w",encoding="utf-8") as f:
-                            f.write(patch)
-      
-                        print("git apply --check …")
-                        res = subprocess.run(
-                            ['git','apply','--check','--whitespace=fix','.gpt_patch.diff'],
-                            capture_output=True, text=True
-                        )
-                        if res.returncode != 0:
-                            print("----- PATCH HEAD (first 80 lines) -----")
-                            print("\n".join(patch.splitlines()[:80]))
-                            print("----- git apply --check stderr -----", file=sys.stderr)
-                            print(res.stderr, file=sys.stderr)
-                            last_err = f"git apply check failed: {res.stderr.strip()}"
-                            time.sleep(1.0)
-                            continue
-      
-                        # 적용
-                        print("git apply …")
-                        res2 = subprocess.run(
-                            ['git','apply','--whitespace=fix','.gpt_patch.diff'],
-                            capture_output=True, text=True
-                        )
-                        if res2.returncode != 0:
-                            print("ERROR: Patch application failed", file=sys.stderr)
-                            print(res2.stderr, file=sys.stderr)
-                            last_err = f"git apply failed: {res2.stderr.strip()}"
-                            time.sleep(1.0)
-                            continue
-      
-                        print("PATCH APPLIED")
-                        try:
-                            os.remove(".gpt_patch.diff")
-                        except Exception:
-                            pass
-                        return  # success
-      
-                    # 모든 시도 실패
-                    print("ERROR: All attempts failed.", file=sys.stderr)
-                    sys.exit(3)
-      
-                if __name__ == "__main__":
-                    main()
-                PY
-                echo "GPT patcher script created successfully"
+          # 보안 설정: 허용/금지 경로
+          SAFE_PATHS = ['app', 'server', 'configs', 'stargate_all_in_one.py']
+          DENY_PATHS = ['.github', 'secrets', 'keys', 'certs']
 
+          # -------------------- Sanitizers --------------------
+          def sanitize_patch(patch: str) -> str:
+              """
+              - CRLF -> LF
+              - 코드펜스( ``` / ```diff / ```python ) 제거
+              - 첫 'diff --git a/' 이전 텍스트 제거
+              - 마지막 개행 보장
+              """
+              s = patch.replace("\r\n","\n").replace("\r","\n")
+              s = re.sub(r'^```[a-zA-Z0-9_-]*\s*\n', '', s, flags=re.M)  # 여는 fence 제거
+              s = re.sub(r'\n?```$', '', s.strip(), flags=0)             # 닫는 fence 제거
+              m = re.search(r'^diff --git a/.*', s, flags=re.M)
+              if m:
+                  s = s[m.start():]
+              return s.strip() + "\n"
+
+          # 허용된 패치 라인만 남기는 강력 정리(재시도 시 사용)
+          def sanitize_strict(patch: str) -> str:
+              allowed = (
+                  'diff --git ', 'index ', 'new file mode ', 'deleted file mode ',
+                  'similarity index ', 'rename from ', 'rename to ',
+                  '--- ', '+++ ', '@@ ', '+', '-', ' ', 'Binary files '
+              )
+              out = []
+              for line in patch.splitlines():
+                  if line == '' or any(line.startswith(p) for p in allowed):
+                      out.append(line)
+              return "\n".join(out).strip() + "\n"
+
+          # -------------------- Path helpers --------------------
+          def _paths_from_patch(patch: str) -> list[str]:
+              """
+              +++ b/path, --- a/path 헤더에서 a/ 또는 b/ 다음의 전체 경로 수집 (/dev/null 제외)
+              """
+              paths = []
+              for line in patch.splitlines():
+                  if line.startswith("+++ b/") or line.startswith("--- a/"):
+                      hdr = line.split("\t")[0]
+                      path = hdr.split(" ", 1)[-1][2:]   # 'a/' 또는 'b/' 제거
+                      if path and path != "/dev/null" and path not in paths:
+                          paths.append(path)
+              return paths
+
+          def ensure_dirs_for_patch(patch: str):
+              for path in _paths_from_patch(patch):
+                  d = os.path.dirname(path)
+                  if d:
+                      os.makedirs(d, exist_ok=True)
+
+          # -------------------- Security check --------------------
+          def validate_patch_security(patch: str) -> bool:
+              for path in _paths_from_patch(patch):
+                  for deny in DENY_PATHS:
+                      if path == deny or path.startswith(deny + "/"):
+                          print(f"ERROR: Denied path detected: {path}", file=sys.stderr)
+                          return False
+                  ok = False
+                  for safe in SAFE_PATHS:
+                      if path == safe or path.startswith(safe + "/"):
+                          ok = True; break
+                  if not ok:
+                      print(f"ERROR: Path outside safe areas: {path}", file=sys.stderr)
+                      return False
+              return True
+
+          # -------------------- OpenAI call --------------------
+          SYSTEM = "Return ONLY a valid git unified diff. No code fences, no prose."
+          USER_TPL = """\
+          오직 유니파이드 패치(git apply 형식) 만 반환하세요.
+
+          새 파일을 만드는 경우 정상 헤더를 포함해야 합니다:
+          - diff --git a/path b/path
+          - new file mode 100644
+          - --- /dev/null
+          - +++ b/path
+          - hunks @@ -0,0 +1,N @@
+
+          제약사항:
+          - 코드·설명·마크다운 금지
+          - 허용 경로만 수정: {safe}
+          - 금지 경로 수정 절대 금지: {deny}
+          - 모호하면 TODO 주석 사용, 과한 추측 금지
+          - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
+
+          지시문:
+          {instructions}
+          """
+
+          def request_patch(client: OpenAI, instructions: str, extra_hint: str="") -> str:
+              user = USER_TPL.format(
+                  safe=", ".join(SAFE_PATHS),
+                  deny=", ".join(DENY_PATHS),
+                  instructions=instructions + ("\n\n실패 힌트:\n" + extra_hint if extra_hint else "")
+              )
+              resp = client.chat.completions.create(
+                  model="gpt-4o-mini",
+                  messages=[
+                      {"role":"system","content": SYSTEM},
+                      {"role":"user","content": user}
+                  ],
+                  temperature=0.1,
+                  max_tokens=6000
+              )
+              return (resp.choices[0].message.content or "").strip()
+
+          # -------------------- Main with retry --------------------
+          def main():
+              if len(sys.argv) < 2:
+                  print("ERROR: No instructions provided", file=sys.stderr)
+                  sys.exit(2)
+              instructions = sys.argv[1]
+
+              api_key = os.getenv("OPENAI_API_KEY")
+              if not api_key:
+                  print("ERROR: OPENAI_API_KEY is not set", file=sys.stderr)
+                  sys.exit(2)
+              client = OpenAI(api_key=api_key)
+
+              attempts = 3
+              last_err = ""
+              for attempt in range(1, attempts+1):
+                  print(f"[Attempt {attempt}/{attempts}] Requesting patch...")
+                  raw = request_patch(client, instructions, extra_hint=last_err)
+                  patch = sanitize_patch(raw)
+                  if attempt >= 2:
+                      patch = sanitize_strict(patch)
+
+                  if not re.search(r"^diff --git a/", patch, flags=re.M):
+                      last_err = "No unified diff header found after sanitize."
+                      print(last_err, file=sys.stderr)
+                      continue
+
+                  if not validate_patch_security(patch):
+                      last_err = "Patch violated security path constraints."
+                      continue
+
+                  ensure_dirs_for_patch(patch)
+
+                  with open(".gpt_patch.diff","w",encoding="utf-8") as f:
+                      f.write(patch)
+
+                  print("git apply --check …")
+                  res = subprocess.run(
+                      ['git','apply','--check','--whitespace=fix','.gpt_patch.diff'],
+                      capture_output=True, text=True
+                  )
+                  if res.returncode != 0:
+                      print("----- PATCH HEAD (first 80 lines) -----")
+                      print("\n".join(patch.splitlines()[:80]))
+                      print("----- git apply --check stderr -----", file=sys.stderr)
+                      print(res.stderr, file=sys.stderr)
+                      last_err = f"git apply check failed: {res.stderr.strip()}"
+                      time.sleep(1.0)
+                      continue
+
+                  print("git apply …")
+                  res2 = subprocess.run(
+                      ['git','apply','--whitespace=fix','.gpt_patch.diff'],
+                      capture_output=True, text=True
+                  )
+                  if res2.returncode != 0:
+                      print("ERROR: Patch application failed", file=sys.stderr)
+                      print(res2.stderr, file=sys.stderr)
+                      last_err = f"git apply failed: {res2.stderr.strip()}"
+                      time.sleep(1.0)
+                      continue
+
+                  print("PATCH APPLIED")
+                  try:
+                      os.remove(".gpt_patch.diff")
+                  except Exception:
+                      pass
+                  return  # success
+
+              print("ERROR: All attempts failed.", file=sys.stderr)
+              sys.exit(3)
+
+          if __name__ == "__main__":
+              main()
+          PY
+          chmod +x "$RUNNER_TEMP/gpt_patcher.py"
+          echo "GPT patcher script created successfully"
+
+      - name: Execute GPT patcher
+        shell: bash
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -e
+          echo "Executing GPT patcher with provided instructions..."
+          python3 "$RUNNER_TEMP/gpt_patcher.py" "${{ github.event.inputs.instructions }}"
+          echo "GPT patcher completed successfully"
 
       - name: Create Pull Request
         uses: peter-evans/create-pull-request@v6
@@ -268,16 +268,16 @@ jobs:
           title: "GPT: apply changes"
           body: |
             ## GPT Generated Changes
-            
+
             This PR was automatically generated by GPT based on the following instructions:
-            
+
             ```
             ${{ github.event.inputs.instructions }}
             ```
-            
+
             **Important:** Please review all changes carefully before merging.
-            
-            - Auto-generated by: `${{ github.workflow }}` workflow
+
+            - Auto-generated by: `${{ github.workflow }}`
             - Run ID: `${{ github.run_id }}`
             - Triggered by: `${{ github.actor }}`
           delete-branch: true
@@ -292,6 +292,7 @@ jobs:
 
       - name: Output PR information
         if: steps.create-pr.outputs.pull-request-number
+        shell: bash
         run: |
           echo "✅ Pull Request created successfully!"
           echo "PR Number: ${{ steps.create-pr.outputs.pull-request-number }}"
