@@ -46,9 +46,9 @@ jobs:
       - name: Create GPT patcher (script)
         shell: bash
         run: |
-          cat > gpt_patcher.py <<'PY'
-          import os, re, subprocess, sys, pathlib
-          from openai import OpenAI
+          cat > "$RUNNER_TEMP/gpt_patcher.py" <<'PY'
+          # (여기에 원래 gpt_patcher.py 코드 내용 그대로 붙여넣기)
+          PY
 
           # 수정 허용/차단 경로 (안전장치)
           SAFE_PATHS = ["app", "server", "configs", "stargate_all_in_one.py"]
@@ -130,7 +130,7 @@ jobs:
         env:
           USER_INSTRUCTIONS: ${{ github.event.inputs.instructions }}
         run: |
-          python gpt_patcher.py
+          python "$RUNNER_TEMP/gpt_patcher.py"
 
       # 여기서 변경된 파일들이 워킹디렉토리에 존재 → 아래 액션이 PR을 생성해줍니다.
       - name: Create Pull Request
