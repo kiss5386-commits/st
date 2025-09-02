@@ -15,11 +15,22 @@ from typing import Dict, List, Optional, Tuple
 import openai
 
 # ===== 설정 =====
-OPENAI_MODEL = "gpt-3.5-turbo"  # 기본 모델 (컨텍스트 길이 제한 대응)
-MAX_CONTEXT_TOKENS = 6000       # 안전 마진 고려한 최대 토큰
-MAX_COMPLETION_TOKENS = 2000    # 응답 토큰 제한
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # 환경변수로 모델 선택
+MAX_CONTEXT_TOKENS = 200000     # GPT-5 기준 대용량 컨텍스트
+MAX_COMPLETION_TOKENS = 16000   # GPT-5 응답 토큰 확대
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 2
+
+# 모델별 토큰 제한 설정
+MODEL_LIMITS = {
+    "gpt-5": {"context": 200000, "completion": 16000},
+    "gpt-5-mini": {"context": 200000, "completion": 8000},
+    "gpt-5-nano": {"context": 128000, "completion": 4000},
+    "gpt-4o": {"context": 120000, "completion": 8000}, 
+    "gpt-4o-mini": {"context": 120000, "completion": 8000},
+    "o1-preview": {"context": 120000, "completion": 32000},
+    "o1-mini": {"context": 120000, "completion": 16000}
+}
 
 # 추적할 파일 패턴
 TRACKED_PATTERNS = [
@@ -172,7 +183,19 @@ class GPTPatcher:
     def __init__(self, api_key: str):
         self.client = openai.OpenAI(api_key=api_key)
         self.token_manager = TokenManager()
-        logger.info("✅ OpenAI 클라이언트 초기화 완료")
+        self.model = OPENAI_MODEL
+        
+        # 모델별 제한 설정
+        if self.model in MODEL_LIMITS:
+            self.max_context = MODEL_LIMITS[self.model]["context"] - 2000  # 안전 마진
+            self.max_completion = MODEL_LIMITS[self.model]["completion"]
+        else:
+            # 기본값 (안전한 설정)
+            self.max_context = 6000
+            self.max_completion = 2000
+            
+        logger.info(f"✅ OpenAI 클라이언트 초기화 완료 (모델: {self.model})")
+        logger.info(f"📊 토큰 제한: Context={self.max_context}, Completion={self.max_completion}")
     
     def create_system_prompt(self) -> str:
         """시스템 프롬프트 생성"""
@@ -241,26 +264,54 @@ class GPTPatcher:
     
     def call_gpt_api(self, instructions: str, files: List[Dict]) -> Optional[Dict]:
         """GPT API 호출"""
-        # 토큰 최적화
-        available_tokens = MAX_CONTEXT_TOKENS - 1000  # 시스템 프롬프트 등을 위한 여유
+        # 동적 토큰 최적화
+        available_tokens = self.max_context - 1000  # 시스템 프롬프트 등을 위한 여유
         optimized_files = self.token_manager.optimize_file_list(files, available_tokens)
         
         system_prompt = self.create_system_prompt()
         user_prompt = self.create_user_prompt(instructions, optimized_files)
         
+        # o1 모델 계열은 다른 파라미터 사용
+        is_o1_model = self.model.startswith("o1")
+        is_gpt5_model = self.model.startswith("gpt-5")
+        
         for attempt in range(RETRY_ATTEMPTS):
             try:
                 logger.info(f"🤖 GPT API 호출 중... (시도 {attempt + 1}/{RETRY_ATTEMPTS})")
                 
-                response = self.client.chat.completions.create(
-                    model=OPENAI_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
-                    ],
-                    max_tokens=MAX_COMPLETION_TOKENS,
-                    temperature=0.3
-                )
+                if is_o1_model:
+                    # o1 모델은 system 메시지를 지원하지 않음
+                    combined_prompt = f"{system_prompt}\n\n{user_prompt}"
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "user", "content": combined_prompt}
+                        ],
+                        max_completion_tokens=self.max_completion
+                    )
+                elif is_gpt5_model:
+                    # GPT-5는 향상된 파라미터 지원
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        max_tokens=self.max_completion,
+                        temperature=0.2,  # GPT-5는 더 낮은 온도로 정확성 향상
+                        top_p=0.9
+                    )
+                else:
+                    # 일반 모델 (GPT-4o 등)
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=[
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": user_prompt}
+                        ],
+                        max_tokens=self.max_completion,
+                        temperature=0.3
+                    )
                 
                 content = response.choices[0].message.content.strip()
                 
