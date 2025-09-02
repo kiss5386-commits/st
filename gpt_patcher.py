@@ -1,21 +1,5 @@
-@staticmethod
-    def truncate_content(content: str, max_tokens: int) -> str:
-        """컨텐츠를 토큰 제한에 맞게 잘라냄"""
-        estimated_tokens = TokenManager.estimate_tokens(content)
-        if estimated_tokens <= max_tokens:
-            return content
-        
-        # 대략적 비율로 잘라내기
-        ratio = max_tokens / estimated_tokens
-        truncate_length = int(len(content) * ratio * 0.9)  # 안전 마진
-        
-        truncated = content[:truncate_length]
-        return truncated + "\n\n[... 내용이 길어 일부 생략됨 ...]"#!/usr/bin/env python3
-"""
-GPT 자동 코드 패치 도구 - 개선된 토큰 관리 버전
-컨텍스트 길이 초과 문제를 해결하고 대용량 파일 처리 능력 강화
-"""
-
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
 import os
 import json
 import yaml
@@ -66,6 +50,20 @@ logger = logging.getLogger(__name__)
 
 class TokenManager:
     """토큰 사용량 관리 및 컨텍스트 최적화"""
+
+    @staticmethod
+    def truncate_content(content: str, max_tokens: int) -> str:
+        """컨텐츠를 토큰 제한에 맞게 잘라냄"""
+        estimated_tokens = TokenManager.estimate_tokens(content)
+        if estimated_tokens <= max_tokens:
+            return content
+
+        # 대략적 비율로 잘라내기(+안전 마진)
+        ratio = max_tokens / max(estimated_tokens, 1)
+        truncate_length = int(len(content) * ratio * 0.9)
+
+        truncated = content[:truncate_length]
+        return truncated + "\n\n[... 내용이 길어 일부 생략됨 ...]"
     
     @staticmethod
     def estimate_tokens(text: str) -> int:
