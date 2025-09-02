@@ -134,8 +134,8 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: gpt/auto-${{ github.run_id }}
           # 지시문 노출/인젝션 방지를 위해 안전한 제목 사용
-          title: "gpt-patcher: ${{
-            fromJSON('{"p":"' ) }}${{ github.run_id }}${{ fromJSON('"}') }}"
+          title: "gpt-patcher: ${{ github.run_id }}"
+
           body: |
             ## 🤖 GPT 자동 코드 수정
 
