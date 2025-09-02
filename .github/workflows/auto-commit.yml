@@ -1,183 +1,334 @@
-name: GPT Auto Commit (apply changes via PR)
+name: GPT Auto Patch Generator
 
 on:
   workflow_dispatch:
     inputs:
       instructions:
-        description: "이번에 코드에 적용할 변경 지시문 (한국어 OK)"
+        description: 'Instructions for GPT to generate code patches'
         required: true
+        type: string
         default: |
-          목적: 설정창에서 Bybit/Bitget 공통 필수값 검증 강화
+          목적: 멀티 거래소 확장을 고려한 최소 안전장치(키값 보호) + 설정 검증 강화
           요구사항:
-            - configs/schema.yaml: api_key, api_secret 필수 / leverage 1~125 / slippage_bps 0~100 / order_timeout_ms 500~60000
-            - server/settings.py: 위 스키마 기반 검증, 위반 시 ValidationError
-            - server/routes/settings.py: PUT /settings 실패 시 400 + code=VALIDATION_ERROR + 필드별 메시지
+            - configs/schema.yaml (없으면 생성):
+                exchanges:
+                  bybit: { api_key: str!, api_secret: str!, leverage: 1..125, slippage_bps: 0..100, order_timeout_ms: 500..60000 }
+                  bitget: bybit와 동일
+            - server/security/redact.py (없으면 생성): redact_secrets(obj) — api_key, api_secret, token/password 류를 "****"로 마스킹
+            - server/settings.py (없으면 생성): 스키마 기반 검증, 위반 시 ValidationError
+            - server/routes/settings.py (없으면 생성): PUT /settings — 실패 400 {code:"VALIDATION_ERROR", errors:[{field,msg}]}; 성공 시 키값 마스킹
+            - stargate_all_in_one.py: 기존 흐름 유지, 검증 호출 연결만 추가
           안전:
-            - .github, secrets, keys, certs 디렉토리는 수정 금지
+            - .github, secrets, keys, certs 디렉토리 수정 금지
             - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
 
-permissions:
-  contents: write
-  pull-requests: write
-
 jobs:
-  pr:
+  gpt-patch:
     runs-on: ubuntu-latest
-    env:
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
-
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           fetch-depth: 0
 
-      - name: Setup Python
+      - name: Setup Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install deps
+      - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          echo "Installing required packages..."
           pip install openai==1.* pyyaml==6.*
+          echo "Dependencies installed successfully"
 
-      - name: Create GPT patcher (script)
-        shell: bash
+      - name: Check worktree status
         run: |
-          cat > "$RUNNER_TEMP/gpt_patcher.py" <<'PY'
-          import os, re, subprocess, sys, pathlib
-          from openai import OpenAI
+          echo "Checking git worktree status..."
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "ERROR: Worktree is dirty. Please commit or stash changes first."
+            exit 1
+          fi
+          echo "Worktree is clean, proceeding..."
 
-          SAFE_PATHS = ["app", "server", "configs", "stargate_all_in_one.py"]
-          DENY_PATHS = [".github", "secrets", "keys", "certs"]
-
-          TEMPLATE = """
-          너는 시드 보호가 최우선인 시니어 파이썬 엔지니어다.
-          아래 '지시문'을 만족하도록 레포의 코드를 수정하는 **유니파이드 패치(git apply 형식)**만 생성하라.
-          규칙:
-          - SAFE_PATHS 안에서만 수정하고, DENY_PATHS에는 절대 손대지 말 것.
-          - 기존 리스크 관리 로직(손절/트레일링/쿨다운)의 기본값/흐름은 유지.
-          - 파일 수정 시에는 **수정된 전체 파일 내용**을 포함한 패치를 생성.
-          - 애매하면 TODO 주석을 남기고 과한 추측은 금지.
-          - 출력에는 패치 내용만 포함(코드펜스/설명 금지).
-
-          SAFE_PATHS={safe}
-          DENY_PATHS={deny}
-
-          지시문:
-          {inst}
+      - name: Create GPT patcher script
+        run: |
+          echo "Creating GPT patcher script..."
+          cat > $RUNNER_TEMP/gpt_patcher.py << 'PY'
+          #!/usr/bin/env python3
           """
-
-          def run(cmd):
-            return subprocess.check_output(cmd, text=True).strip()
-
-          def ensure_clean():
-            status = run(["git","status","--porcelain"])
-            if status:
-              print("Worktree not clean", file=sys.stderr); sys.exit(1)
-
-          # --- 패치 정리: 코드펜스/앞뒤 텍스트 제거, 개행 보정 ---
+          GPT 기반 코드 패치 생성기
+          - OpenAI API를 사용하여 코드 변경사항을 unified diff 형식으로 생성
+          - 보안 규칙 및 경로 제한을 통한 안전한 패치 적용
+          - 완전 자동화된 검증 및 적용 프로세스
+          """
+          
+          import os
+          import sys
+          import re
+          import subprocess
+          from openai import OpenAI
+          
+          # 보안 설정: 허용/금지 경로
+          SAFE_PATHS = ['app', 'server', 'configs', 'stargate_all_in_one.py']
+          DENY_PATHS = ['.github', 'secrets', 'keys', 'certs']
+          
           def sanitize_patch(patch: str) -> str:
-            s = patch.replace("\r\n","\n").replace("\r","\n")
-            s = re.sub(r"^```(?:diff)?\n", "", s, flags=re.M)
-            s = s.replace("```", "")
-            m = re.search(r"^diff --git a/.*", s, flags=re.M)
-            if m:
-              s = s[m.start():]
-            return s.strip() + "\n"
-
-          # --- 폴더 자동 생성: 패치에 등장하는 부모 디렉토리 미리 생성 ---
-          def _paths_from_patch(patch: str):
-            paths = []
-            for line in patch.splitlines():
-              if line.startswith("+++ b/") or line.startswith("--- a/"):
-                p = line.split("\t")[0].split(" ", 1)[-1][2:]  # b/path or a/path
-                if p != "/dev/null":
-                  paths.append(p)
-            return paths
-
+              """
+              LLM 출력에서 순수 git unified diff만 추출하여 정리
+              - 코드펜스 제거
+              - CRLF를 LF로 통일
+              - diff --git 이전의 모든 설명 텍스트 제거
+              - 공백 정리 및 마지막 개행 보장
+              """
+              print("Sanitizing patch output...")
+              
+              # CRLF를 LF로 통일
+              patch = patch.replace('\r\n', '\n').replace('\r', '\n')
+              
+              # 코드펜스 제거 (```diff, ```, ```python 등)
+              patch = re.sub(r'^```[a-zA-Z]*\n', '', patch, flags=re.MULTILINE)
+              patch = re.sub(r'^```\s*$', '', patch, flags=re.MULTILINE)
+              
+              # 첫 번째 diff --git 이전의 모든 텍스트 제거
+              lines = patch.split('\n')
+              diff_start = -1
+              for i, line in enumerate(lines):
+                  if line.startswith('diff --git'):
+                      diff_start = i
+                      break
+              
+              if diff_start >= 0:
+                  patch = '\n'.join(lines[diff_start:])
+              
+              # 끝 공백 정리 및 마지막 개행 보장
+              patch = patch.strip() + '\n'
+              
+              print(f"Patch sanitized, size: {len(patch)} characters")
+              return patch
+          
+          def _paths_from_patch(patch: str) -> list[str]:
+              """
+              패치에서 대상 파일 경로들을 추출
+              +++ b/path 및 --- a/path 형식에서 경로 수집 (/dev/null 제외)
+              """
+              print("Extracting file paths from patch...")
+              paths = []
+              
+              for line in patch.split('\n'):
+                  # +++ b/경로 또는 --- a/경로 형식 찾기
+                  if line.startswith('+++ b/') or line.startswith('--- a/'):
+                      path = line.split('/', 2)[-1] if '/' in line else ''
+                      if path and path != 'dev/null' and path not in paths:
+                          paths.append(path)
+              
+              print(f"Found {len(paths)} file paths: {paths}")
+              return paths
+          
           def ensure_dirs_for_patch(patch: str):
-            for p in _paths_from_patch(patch):
-              d = os.path.dirname(p)
-              if d and not os.path.exists(d):
-                os.makedirs(d, exist_ok=True)
-
+              """
+              패치에 등장하는 파일들의 부모 디렉토리를 미리 생성
+              새 파일 생성 시 디렉토리가 없어서 실패하는 것을 방지
+              """
+              print("Ensuring directories exist for patch files...")
+              paths = _paths_from_patch(patch)
+              
+              for path in paths:
+                  dir_path = os.path.dirname(path)
+                  if dir_path:
+                      os.makedirs(dir_path, exist_ok=True)
+                      print(f"Created directory: {dir_path}")
+          
+          def validate_patch_security(patch: str) -> bool:
+              """
+              패치가 보안 규칙을 위반하지 않는지 검증
+              - 금지 경로 접근 시도 검사
+              - 허용 경로 외부 수정 시도 검사
+              """
+              print("Validating patch security...")
+              paths = _paths_from_patch(patch)
+              
+              for path in paths:
+                  # 금지 경로 검사
+                  for deny_path in DENY_PATHS:
+                      if path.startswith(deny_path + '/') or path == deny_path:
+                          print(f"ERROR: Denied path detected: {path}", file=sys.stderr)
+                          return False
+                  
+                  # 허용 경로 검사
+                  is_safe = False
+                  for safe_path in SAFE_PATHS:
+                      if path.startswith(safe_path + '/') or path == safe_path:
+                          is_safe = True
+                          break
+                  
+                  if not is_safe:
+                      print(f"ERROR: Path outside safe areas: {path}", file=sys.stderr)
+                      return False
+              
+              print("Patch security validation passed")
+              return True
+          
           def main():
-            ensure_clean()
-            instructions = os.environ.get("USER_INSTRUCTIONS","").strip()
-            if not instructions:
-              print("No instructions provided", file=sys.stderr); sys.exit(2)
-
-            prompt = TEMPLATE.format(
-              safe=",".join(SAFE_PATHS),
-              deny=",".join(DENY_PATHS),
-              inst=instructions
-            )
-
-            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-            resp = client.chat.completions.create(
-              model="gpt-4o-mini",
-              messages=[
-                {"role":"system","content":"Return ONLY a valid git unified diff. No code fences, no prose."},
-                {"role":"user","content":prompt}
-              ],
-              temperature=0.1,
-            )
-            raw = (resp.choices[0].message.content or "")
-            patch = sanitize_patch(raw)
-
-            if not re.search(r"^diff --git a/", patch, flags=re.M):
-              print("No unified diff header found after sanitize.", file=sys.stderr)
-              print(patch[:800])
-              sys.exit(3)
-
-            for line in patch.splitlines():
-              if line.startswith(("+++ b/","--- a/")):
-                path = line.split("\t")[0].split(" ",1)[-1][2:]
-                if any(f"/{d.strip('/')}/" in f"/{path}" for d in DENY_PATHS):
-                  print(f"Patch touches denied path: {path}", file=sys.stderr)
+              print("Starting GPT patcher...")
+              
+              # 명령줄 인자 확인
+              if len(sys.argv) < 2:
+                  print("ERROR: No instructions provided", file=sys.stderr)
+                  sys.exit(2)
+              
+              instructions = sys.argv[1]
+              print(f"Instructions received: {len(instructions)} characters")
+              
+              # OpenAI 클라이언트 초기화
+              api_key = os.getenv('OPENAI_API_KEY')
+              if not api_key:
+                  print("ERROR: OPENAI_API_KEY environment variable not set", file=sys.stderr)
+                  sys.exit(2)
+              
+              client = OpenAI(api_key=api_key)
+              
+              # GPT에게 패치 요청
+              print("Requesting patch from OpenAI...")
+              try:
+                  response = client.chat.completions.create(
+                      model="gpt-4",
+                      messages=[
+                          {
+                              "role": "system",
+                              "content": "오직 유효한 git unified diff만 반환. 코드펜스·설명 금지."
+                          },
+                          {
+                              "role": "user",
+                              "content": f"""
+          오직 유니파이드 패치(git apply 형식) 만 반환하세요.
+          
+          새 파일을 만드는 경우 정상 헤더를 포함해야 합니다:
+          - diff --git a/path b/path
+          - new file mode 100644
+          - --- /dev/null
+          - +++ b/path
+          - hunks @@ -0,0 +1,N @@
+          
+          제약사항:
+          - 코드·설명·마크다운 금지
+          - 허용 경로만 수정: {', '.join(SAFE_PATHS)}
+          - 금지 경로 수정 절대 금지: {', '.join(DENY_PATHS)}
+          - 모호하면 TODO 주석 사용, 과한 추측 금지
+          - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
+          
+          지시문:
+          {instructions}
+                              """
+                          }
+                      ],
+                      temperature=0.1,
+                      max_tokens=4000
+                  )
+                  
+                  patch_content = response.choices[0].message.content.strip()
+                  print(f"Received response: {len(patch_content)} characters")
+                  
+              except Exception as e:
+                  print(f"ERROR: OpenAI API call failed: {e}", file=sys.stderr)
+                  sys.exit(2)
+              
+              # 패치 정리
+              clean_patch = sanitize_patch(patch_content)
+              
+              # diff 헤더 존재 확인
+              if not re.search(r'^diff --git', clean_patch, re.MULTILINE):
+                  print("ERROR: No valid diff headers found in response", file=sys.stderr)
+                  sys.exit(3)
+              
+              # 보안 검증
+              if not validate_patch_security(clean_patch):
                   sys.exit(4)
-
-            pathlib.Path(".gpt_patch.diff").write_text(patch, encoding="utf-8")
-            ensure_dirs_for_patch(patch)
-            subprocess.check_call(["git","apply","--check","--whitespace=fix",".gpt_patch.diff"])
-            print("DRY-RUN OK")
-
-            subprocess.check_call(["git","apply","--whitespace=fix",".gpt_patch.diff"])
-            print("PATCH APPLIED")
-
+              
+              # 디렉토리 생성
+              ensure_dirs_for_patch(clean_patch)
+              
+              # 패치 파일 저장
+              patch_file = '.gpt_patch.diff'
+              print(f"Saving patch to {patch_file}...")
+              with open(patch_file, 'w', encoding='utf-8') as f:
+                  f.write(clean_patch)
+              
+              # git apply 검증
+              print("Validating patch with git apply --check...")
+              result = subprocess.run([
+                  'git', 'apply', '--check', '--whitespace=fix', patch_file
+              ], capture_output=True, text=True)
+              
+              if result.returncode != 0:
+                  print(f"ERROR: Patch validation failed: {result.stderr}", file=sys.stderr)
+                  sys.exit(3)
+              
+              # 패치 적용
+              print("Applying patch...")
+              result = subprocess.run([
+                  'git', 'apply', '--whitespace=fix', patch_file
+              ], capture_output=True, text=True)
+              
+              if result.returncode != 0:
+                  print(f"ERROR: Patch application failed: {result.stderr}", file=sys.stderr)
+                  sys.exit(3)
+              
+              print("Patch applied successfully!")
+              
+              # 임시 파일 정리
+              os.remove(patch_file)
+              
           if __name__ == "__main__":
-            main()
+              main()
           PY
+          echo "GPT patcher script created successfully"
 
-      - name: Run GPT patcher (dry-run + apply)
+      - name: Execute GPT patcher
         env:
-          USER_INSTRUCTIONS: ${{ github.event.inputs.instructions }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: |
-          python "$RUNNER_TEMP/gpt_patcher.py"
+          echo "Executing GPT patcher with provided instructions..."
+          python3 $RUNNER_TEMP/gpt_patcher.py "${{ github.event.inputs.instructions }}"
+          echo "GPT patcher completed successfully"
 
       - name: Create Pull Request
-        id: cpr
         uses: peter-evans/create-pull-request@v6
+        id: create-pr
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: gpt/change-${{ github.run_id }}
           commit-message: "GPT: apply changes"
-          title: "GPT: proposed changes"
+          title: "GPT: apply changes"
           body: |
-            자동 생성된 PR입니다.
-
-            지시문:
+            ## GPT Generated Changes
+            
+            This PR was automatically generated by GPT based on the following instructions:
+            
             ```
             ${{ github.event.inputs.instructions }}
             ```
-          branch: gpt/change-${{ github.run_id }}
-          base: ${{ github.event.repository.default_branch }}
+            
+            **Important:** Please review all changes carefully before merging.
+            
+            - Auto-generated by: `${{ github.workflow }}` workflow
+            - Run ID: `${{ github.run_id }}`
+            - Triggered by: `${{ github.actor }}`
           delete-branch: true
 
-      - name: Enable auto-merge (optional)
-        if: steps.cpr.outputs.pull-request-operation == 'created'
+      - name: Enable auto-merge (squash)
+        if: steps.create-pr.outputs.pull-request-number
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
-          pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
+          pull-request-number: ${{ steps.create-pr.outputs.pull-request-number }}
           merge-method: squash
+
+      - name: Output PR information
+        if: steps.create-pr.outputs.pull-request-number
+        run: |
+          echo "✅ Pull Request created successfully!"
+          echo "PR Number: ${{ steps.create-pr.outputs.pull-request-number }}"
+          echo "PR URL: ${{ steps.create-pr.outputs.pull-request-url }}"
+          echo "Branch: gpt/change-${{ github.run_id }}"
