@@ -113,17 +113,33 @@ jobs:
           git diff --cached --name-status
         fi
     
-    - name: Commit changes
-      if: steps.changes.outputs.has_changes == 'true'
+    - name: Commit & Push
+      if: ${{ success() && (github.event.inputs.dry_run == '' || github.event.inputs.dry_run != 'true') }}
+      shell: bash
       run: |
+        set -euo pipefail
+        git config user.name  "st-bot"
+        git config user.email "st-bot@users.noreply.github.com"
+    
         git add -A
-        
-        COMMIT_MSG_RAW="${{ github.event.inputs.instructions }}"
-        COMMIT_MSG_SAFE=$(printf '%s' "$COMMIT_MSG_RAW" | tr '\n' ' ' | sed 's/`/´/g')
-        git commit -m "🤖 GPT 자동 수정: ${COMMIT_MSG_SAFE}" -m "Run ID: ${{ github.run_id }}" -m "Model: ${{ github.event.inputs.model }}"
+    
+        # 변경 없으면 스킵
+        if git diff --cached --quiet; then
+          echo "No changes to commit."
+          exit 0
+        fi
+    
+        # 입력 JSON에서 plan 이름만 안전하게 추출(jq 없으면 빈값)
+        PLAN_NAME=$(printf '%s' "${{ github.event.inputs.instructions }}" | jq -r '.plan // empty' 2>/dev/null || true)
+        [ -z "$PLAN_NAME" ] && PLAN_NAME="apply plan"
+    
+        git commit -m "gpt-patcher: ${PLAN_NAME}" \
+                   -m "Run ID: ${{ github.run_id }}" \
+                   -m "Model: ${{ github.event.inputs.model || 'gpt-5' }}"
+    
+        git push
 
-        
-        echo "✅ 변경사항 커밋 완료"
+
     
     - name: Create Pull Request
       if: steps.changes.outputs.has_changes == 'true'
