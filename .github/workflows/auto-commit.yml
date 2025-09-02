@@ -1,42 +1,159 @@
-name: Auto Commit (via PR + Auto-merge)
+name: GPT Auto Commit (apply changes via PR)
 
 on:
-  workflow_dispatch: {}     # 수동 실행 (원하면 schedule 추가 가능)
+  workflow_dispatch:
+    inputs:
+      instructions:
+        description: "이번에 코드에 적용할 변경 지시문 (한국어 OK)"
+        required: true
+        default: |
+          목적: 설정창에서 Bybit/Bitget 공통 필수값 검증 강화
+          요구사항:
+            - configs/schema.yaml: api_key, api_secret 필수 / leverage 1~125 / slippage_bps 0~100 / order_timeout_ms 500~60000
+            - server/settings.py: 위 스키마 기반 검증, 위반 시 ValidationError
+            - server/routes/settings.py: PUT /settings 실패 시 400 + code=VALIDATION_ERROR + 필드별 메시지
+          안전:
+            - .github, secrets, keys, certs 디렉토리는 수정 금지
+            - 리스크 로직(손절/트레일링/쿨다운) 기본값/흐름 변경 금지
 
 permissions:
-  contents: write           # 파일 변경 커밋
-  pull-requests: write      # PR 생성/자동머지
+  contents: write
+  pull-requests: write
 
 jobs:
   pr:
     runs-on: ubuntu-latest
+    env:
+      # 🔑 여기서 OpenAI 키를 가져옵니다. (이미 Secrets에 넣으셨음)
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Append timestamp (always changes)
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install openai==1.* pyyaml==6.*
+
+      - name: Create GPT patcher (script)
         shell: bash
         run: |
-          echo "Last run: $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> last_run.txt
+          cat > gpt_patcher.py <<'PY'
+          import os, re, subprocess, sys, pathlib
+          from openai import OpenAI
 
-      # PR 생성
+          # 수정 허용/차단 경로 (안전장치)
+          SAFE_PATHS = ["app", "server", "configs", "stargate_all_in_one.py"]
+          DENY_PATHS = [".github", "secrets", "keys", "certs"]
+
+          TEMPLATE = """
+          너는 시드 보호가 최우선인 시니어 파이썬 엔지니어다.
+          아래 '지시문'을 만족하도록 레포의 코드를 수정하는 **유니파이드 패치(git apply 형식)**만 생성하라.
+          규칙:
+          - SAFE_PATHS 안에서만 수정하고, DENY_PATHS에는 절대 손대지 말 것.
+          - 기존 리스크 관리 로직(손절/트레일링/쿨다운)의 기본값/흐름은 유지.
+          - 파일 수정 시에는 **수정된 전체 파일 내용**을 포함한 패치를 생성.
+          - 애매하면 TODO 주석을 남기고 과한 추측은 금지.
+          - 출력에는 패치 내용만 포함(설명/문장 금지).
+
+          SAFE_PATHS={safe}
+          DENY_PATHS={deny}
+
+          지시문:
+          {inst}
+          """
+
+          def run(cmd):
+            return subprocess.check_output(cmd, text=True).strip()
+
+          def ensure_clean():
+            status = run(["git","status","--porcelain"])
+            if status:
+              print("Worktree not clean", file=sys.stderr); sys.exit(1)
+
+          def main():
+            ensure_clean()
+            instructions = os.environ.get("USER_INSTRUCTIONS","").strip()
+            if not instructions:
+              print("No instructions provided", file=sys.stderr); sys.exit(2)
+
+            prompt = TEMPLATE.format(
+              safe=",".join(SAFE_PATHS),
+              deny=",".join(DENY_PATHS),
+              inst=instructions
+            )
+
+            client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+            resp = client.chat.completions.create(
+              model="gpt-4o-mini",
+              messages=[{"role":"user","content":prompt}],
+              temperature=0.1,
+            )
+            patch = resp.choices[0].message.content.strip()
+
+            # 최소 검증: diff 헤더 확인
+            if not re.search(r"^diff --git a/", patch, flags=re.M):
+              print("No unified diff found from GPT.", file=sys.stderr)
+              print(patch[:800])
+              sys.exit(3)
+
+            # 금지 경로 터치 여부 검사
+            for line in patch.splitlines():
+              if line.startswith(("+++ b/","--- a/")):
+                path = line.split("\t")[0].split(" ",1)[-1][2:]
+                if any(f"/{d.strip('/')}/" in f"/{path}" for d in DENY_PATHS):
+                  print(f"Patch touches denied path: {path}", file=sys.stderr)
+                  sys.exit(4)
+
+            # dry-run 검사
+            pathlib.Path(".gpt_patch.diff").write_text(patch, encoding="utf-8")
+            subprocess.check_call(["git","apply","--check",".gpt_patch.diff"])
+            print("DRY-RUN OK")
+
+            # 실제 적용
+            subprocess.check_call(["git","apply",".gpt_patch.diff"])
+            print("PATCH APPLIED")
+
+          if __name__ == "__main__":
+            main()
+          PY
+
+      - name: Run GPT patcher (dry-run + apply)
+        env:
+          USER_INSTRUCTIONS: ${{ github.event.inputs.instructions }}
+        run: |
+          python gpt_patcher.py
+
+      # 여기서 변경된 파일들이 워킹디렉토리에 존재 → 아래 액션이 PR을 생성해줍니다.
       - name: Create Pull Request
         id: cpr
         uses: peter-evans/create-pull-request@v6
         with:
-          commit-message: "chore: auto-commit (timestamp)"
-          title: "chore: auto-commit (timestamp)"
-          body: "자동 생성된 PR입니다."
-          branch: auto/last-run
-          base: ${{ github.event.repository.default_branch }}
-          delete-branch: true           # 머지 후 작업브랜치 삭제
+          commit-message: "GPT: apply changes"
+          title: "GPT: proposed changes"
+          body: |
+            자동 생성된 PR입니다.
 
-      # 자동 머지 활성화 (PR이 새로 생성됐을 때)
-      - name: Enable auto-merge
+            지시문:
+            ```
+            ${{ github.event.inputs.instructions }}
+            ```
+          branch: gpt/change-${{ github.run_id }}
+          base: ${{ github.event.repository.default_branch }}
+          delete-branch: true
+
+      - name: Enable auto-merge (optional)
         if: steps.cpr.outputs.pull-request-operation == 'created'
         uses: peter-evans/enable-pull-request-automerge@v3
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           pull-request-number: ${{ steps.cpr.outputs.pull-request-number }}
-          merge-method: squash          # 원하면 merge|rebase로 변경 가능
+          merge-method: squash
