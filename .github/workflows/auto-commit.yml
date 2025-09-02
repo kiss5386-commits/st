@@ -7,6 +7,24 @@ on:
         description: '한글 지시문 (코드 수정 내용)'
         required: true
         type: string
+      model:
+        description: 'OpenAI 모델 선택'
+        required: false
+        default: 'gpt-5-mini'
+        type: choice
+        options:
+          - 'gpt-5'
+          - 'gpt-5-mini'
+          - 'gpt-5-nano'
+          - 'gpt-4o'
+          - 'gpt-4o-mini'
+          - 'o1-preview'
+          - 'o1-mini'
+      max_files:
+        description: '최대 처리 파일 수'
+        required: false
+        default: '10'
+        type: string
 
 permissions:
   contents: write
@@ -31,54 +49,163 @@ jobs:
     - name: Install dependencies
       run: |
         python -m pip install --upgrade pip
-        pip install openai>=1.0.0 pyyaml requests
+        pip install openai>=1.0.0 pyyaml requests pathlib typing-extensions
     
     - name: Configure Git
       run: |
         git config --global user.name "GPT Auto Modifier"
         git config --global user.email "gpt-auto@noreply.github.com"
     
+    - name: Backup current state
+      run: |
+        # 현재 상태 백업 (안전장치)
+        git add -A
+        git stash push -m "Backup before GPT modification - $(date)"
+        echo "🔒 현재 상태 백업 완료"
+    
     - name: Execute GPT Patcher
       env:
         OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         USER_INSTRUCTIONS: ${{ github.event.inputs.instructions }}
+        OPENAI_MODEL: ${{ github.event.inputs.model }}
+        MAX_FILES: ${{ github.event.inputs.max_files }}
         GITHUB_RUN_ID: ${{ github.run_id }}
       run: |
+        echo "🚀 GPT 패처 실행 시작"
+        echo "📝 지시문: $USER_INSTRUCTIONS"
+        echo "🤖 모델: $OPENAI_MODEL"
+        echo "📂 최대 파일: $MAX_FILES"
+        
+        # GPT 패처 실행
         python3 gpt_patcher.py
+        
+        # 실행 결과 확인
+        if [ $? -eq 0 ]; then
+          echo "✅ GPT 패처 실행 성공"
+        else
+          echo "❌ GPT 패처 실행 실패"
+          echo "🔄 백업 상태로 복원 중..."
+          git stash pop || true
+          exit 1
+        fi
+    
+    - name: Check for changes
+      id: changes
+      run: |
+        if git diff --quiet && git diff --cached --quiet; then
+          echo "변경사항이 없습니다"
+          echo "has_changes=false" >> $GITHUB_OUTPUT
+        else
+          echo "변경사항이 발견되었습니다"
+          echo "has_changes=true" >> $GITHUB_OUTPUT
+          
+          # 변경된 파일 목록 출력
+          echo "📋 변경된 파일:"
+          git diff --name-status
+          git diff --cached --name-status
+        fi
+    
+    - name: Commit changes
+      if: steps.changes.outputs.has_changes == 'true'
+      run: |
+        git add -A
+        
+        # 커밋 메시지 생성
+        COMMIT_MSG="🤖 GPT 자동 수정: ${{ github.event.inputs.instructions }}"
+        
+        # 커밋 실행
+        git commit -m "$COMMIT_MSG" -m "Run ID: ${{ github.run_id }}" -m "Model: ${{ github.event.inputs.model }}"
+        
+        echo "✅ 변경사항 커밋 완료"
     
     - name: Create Pull Request
-      if: success()
+      if: steps.changes.outputs.has_changes == 'true'
       uses: peter-evans/create-pull-request@v6
+      id: create_pr
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-        branch: gpt/change-${{ github.run_id }}
-        title: "GPT 자동 수정: ${{ github.event.inputs.instructions }}"
+        branch: gpt/auto-${{ github.run_id }}
+        title: "🤖 GPT 자동 수정: ${{ github.event.inputs.instructions }}"
         body: |
-          ## GPT 자동 코드 수정
+          ## 🤖 GPT 자동 코드 수정
           
-          **지시문:**
+          **📝 지시문:**
           ```
           ${{ github.event.inputs.instructions }}
           ```
           
-          **Run ID:** ${{ github.run_id }}
+          **⚙️ 설정:**
+          - **모델:** ${{ github.event.inputs.model }}
+          - **최대 파일:** ${{ github.event.inputs.max_files }}
+          - **Run ID:** ${{ github.run_id }}
+          - **실행 시간:** ${{ steps.date.outputs.date }}
+          
+          **📋 변경사항:**
+          이 PR에는 GPT가 자동으로 생성/수정한 파일들이 포함되어 있습니다.
+          
+          **⚠️ 주의사항:**
+          - 코드 리뷰 후 머지하는 것을 권장합니다
+          - 필요시 추가 테스트를 진행해주세요
           
           ---
-          *이 PR은 GPT에 의해 자동으로 생성되었습니다.*
-        commit-message: "GPT: ${{ github.event.inputs.instructions }}"
+          *이 PR은 GPT Patcher에 의해 자동으로 생성되었습니다.*
+        commit-message: "🤖 GPT: ${{ github.event.inputs.instructions }}"
         delete-branch: true
+        assignees: ${{ github.actor }}
+        reviewers: ${{ github.actor }}
         
-    - name: Auto-merge PR
-      if: success()
+    - name: Auto-merge PR (선택적)
+      if: steps.changes.outputs.has_changes == 'true' && contains(github.event.inputs.instructions, '[AUTO_MERGE]')
       run: |
-        # PR이 생성되었다면 자동 머지 시도
-        PR_NUMBER=$(gh pr list --head "gpt/change-${{ github.run_id }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        # [AUTO_MERGE] 태그가 있는 경우에만 자동 머지
+        PR_NUMBER=$(gh pr list --head "gpt/auto-${{ github.run_id }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
+        
         if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
-          echo "PR #$PR_NUMBER 자동 머지 시도"
-          gh pr merge $PR_NUMBER --squash --auto
-          echo "PR #$PR_NUMBER 머지 완료"
+          echo "🔄 PR #$PR_NUMBER 자동 머지 시도"
+          
+          # 잠시 대기 (PR 생성 완료 대기)
+          sleep 5
+          
+          # 자동 머지 실행
+          gh pr merge $PR_NUMBER --squash --auto || {
+            echo "⚠️ 자동 머지 실패 - 수동 확인 필요"
+            gh pr comment $PR_NUMBER --body "⚠️ 자동 머지에 실패했습니다. 코드 리뷰 후 수동으로 머지해주세요."
+          }
+          
+          echo "✅ 자동 머지 처리 완료"
         else
-          echo "생성된 PR이 없거나 변경사항이 없습니다"
+          echo "❌ PR을 찾을 수 없습니다"
         fi
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    
+    - name: Cleanup on failure
+      if: failure()
+      run: |
+        echo "💥 작업 실패 - 정리 작업 시작"
+        
+        # 백업에서 복원
+        git stash pop 2>/dev/null || echo "복원할 백업이 없습니다"
+        
+        # 임시 브랜치 정리
+        git branch -D "gpt/auto-${{ github.run_id }}" 2>/dev/null || true
+        
+        echo "🧹 정리 작업 완료"
+    
+    - name: Summary
+      if: always()
+      run: |
+        echo "📊 GPT 자동 수정 요약"
+        echo "===================="
+        echo "📝 지시문: ${{ github.event.inputs.instructions }}"
+        echo "🤖 모델: ${{ github.event.inputs.model }}"
+        echo "📂 최대 파일: ${{ github.event.inputs.max_files }}"
+        echo "🔄 Run ID: ${{ github.run_id }}"
+        
+        if [ "${{ steps.changes.outputs.has_changes }}" = "true" ]; then
+          echo "✅ 상태: 변경사항 있음 - PR 생성됨"
+        else
+          echo "ℹ️ 상태: 변경사항 없음"
+        fi
+        
+        echo "===================="
