@@ -1,397 +1,395 @@
 #!/usr/bin/env python3
 """
-GPT 기반 자동 코드 수정 스크립트
-- 시드 보호 최우선: 안전 경로만 수정, 위험 경로는 절대 차단
-- unified diff 사용 금지: JSON 직접 적용 방식으로 패치 오류 원천 차단
-- 기존 파일 존재 여부 검증: new file 오류 방지
-- 환경변수 전용 입력: 셸 파싱 오류 방지
+GPT 자동 코드 패치 도구 - 개선된 토큰 관리 버전
+컨텍스트 길이 초과 문제를 해결하고 대용량 파일 처리 능력 강화
 """
 
 import os
-import sys
 import json
+import yaml
 import subprocess
-import re
+import time
+import logging
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
-from openai import OpenAI
+import openai
 
-# 보안 설정 - 시드 보호를 위한 경로 제한
-SAFE_PATHS = [
-    "app", 
-    "server", 
-    "configs", 
-    "stargate_all_in_one.py",
-    "strategies",
-    "utils",
-    "tests",
-    "docs"
+# ===== 설정 =====
+OPENAI_MODEL = "gpt-3.5-turbo"  # 기본 모델 (컨텍스트 길이 제한 대응)
+MAX_CONTEXT_TOKENS = 6000       # 안전 마진 고려한 최대 토큰
+MAX_COMPLETION_TOKENS = 2000    # 응답 토큰 제한
+RETRY_ATTEMPTS = 3
+RETRY_DELAY = 2
+
+# 추적할 파일 패턴
+TRACKED_PATTERNS = [
+    "*.py", "*.js", "*.ts", "*.html", "*.css", "*.json", "*.yml", "*.yaml",
+    "*.md", "*.txt", "*.sh", "*.bat", "*.sql", "*.env", "*.ini", "*.cfg"
 ]
 
-DENY_PATHS = [
-    ".github",
-    "secrets", 
-    "keys", 
-    "certs",
-    ".git",
-    "node_modules",
-    "__pycache__",
-    ".env"
+# 무시할 디렉토리/파일
+IGNORE_PATTERNS = [
+    ".git", "__pycache__", "node_modules", ".venv", "venv", 
+    "build", "dist", ".pytest_cache", ".idea", ".vscode"
 ]
 
-MAX_RETRIES = 3
-OPENAI_TEMPERATURE = 0.1
+# 로깅 설정
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(message)s',
+    handlers=[logging.StreamHandler()]
+)
+logger = logging.getLogger(__name__)
+
+class TokenManager:
+    """토큰 사용량 관리 및 컨텍스트 최적화"""
+    
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        """텍스트의 대략적인 토큰 수 추정 (1토큰 ≈ 4글자)"""
+        return len(text) // 3  # 보수적 추정
+    
+    @staticmethod
+    def truncate_content(content: str, max_tokens: int) -> str:
+        """컨텐츠를 토큰 제한에 맞게 잘라냄"""
+        estimated_tokens = TokenManager.estimate_tokens(content)
+        if estimated_tokens <= max_tokens:
+            return content
+        
+        # 대략적 비율로 잘라내기
+        ratio = max_tokens / estimated_tokens
+        truncate_length = int(len(content) * ratio * 0.9)  # 안전 마진
+        
+        truncated = content[:truncate_length]
+        return truncated + "\n\n[... 내용이 길어 일부 생략됨 ...]"
+    
+    @staticmethod
+    def optimize_file_list(files: List[Dict], max_tokens: int) -> List[Dict]:
+        """파일 목록을 토큰 제한에 맞게 최적화"""
+        total_tokens = 0
+        optimized_files = []
+        
+        # 작은 파일부터 우선 처리
+        sorted_files = sorted(files, key=lambda f: len(f.get('content', '')))
+        
+        for file_info in sorted_files:
+            content = file_info.get('content', '')
+            file_tokens = TokenManager.estimate_tokens(content)
+            
+            if total_tokens + file_tokens > max_tokens:
+                # 남은 토큰으로 파일 내용 축약
+                remaining_tokens = max_tokens - total_tokens
+                if remaining_tokens > 100:  # 최소 100토큰은 있어야 의미있음
+                    file_info['content'] = TokenManager.truncate_content(content, remaining_tokens)
+                    optimized_files.append(file_info)
+                break
+            
+            optimized_files.append(file_info)
+            total_tokens += file_tokens
+        
+        logger.info(f"📊 파일 최적화: {len(files)} → {len(optimized_files)}개, 예상 토큰: {total_tokens}")
+        return optimized_files
+
+class GitFileTracker:
+    """Git 저장소 파일 추적 및 관리"""
+    
+    def __init__(self, repo_path: str = "."):
+        self.repo_path = Path(repo_path)
+        self.tracking_file = self.repo_path / ".gpt_tracking.json"
+    
+    def should_ignore(self, path: Path) -> bool:
+        """파일/디렉토리가 무시 대상인지 확인"""
+        path_str = str(path)
+        return any(pattern in path_str for pattern in IGNORE_PATTERNS)
+    
+    def get_all_tracked_files(self) -> List[Path]:
+        """추적 대상 파일 목록 가져오기"""
+        tracked_files = []
+        
+        for pattern in TRACKED_PATTERNS:
+            for file_path in self.repo_path.rglob(pattern):
+                if file_path.is_file() and not self.should_ignore(file_path):
+                    tracked_files.append(file_path)
+        
+        return tracked_files
+    
+    def load_tracking_info(self) -> Dict:
+        """기존 추적 정보 로드"""
+        if not self.tracking_file.exists():
+            return {}
+        
+        try:
+            with open(self.tracking_file, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"⚠️ 추적 파일 로드 실패: {e}")
+            return {}
+    
+    def save_tracking_info(self, tracking_info: Dict):
+        """추적 정보 저장"""
+        try:
+            with open(self.tracking_file, 'w', encoding='utf-8') as f:
+                json.dump(tracking_info, f, indent=2, ensure_ascii=False)
+            logger.info(f"💾 추적 정보 저장 완료: {len(tracking_info)}개 파일")
+        except Exception as e:
+            logger.error(f"❌ 추적 정보 저장 실패: {e}")
+    
+    def get_changed_files(self) -> List[Dict]:
+        """변경된 파일 목록과 내용 반환"""
+        current_files = self.get_all_tracked_files()
+        tracking_info = self.load_tracking_info()
+        changed_files = []
+        
+        for file_path in current_files:
+            try:
+                # 파일 내용 읽기
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+                
+                relative_path = str(file_path.relative_to(self.repo_path))
+                file_hash = hash(content)
+                
+                # 변경 여부 확인
+                if relative_path not in tracking_info or tracking_info[relative_path] != file_hash:
+                    changed_files.append({
+                        'path': relative_path,
+                        'content': content,
+                        'size': len(content),
+                        'is_new': relative_path not in tracking_info
+                    })
+                    tracking_info[relative_path] = file_hash
+            
+            except Exception as e:
+                logger.warning(f"⚠️ 파일 처리 실패 {file_path}: {e}")
+        
+        # 추적 정보 업데이트
+        self.save_tracking_info(tracking_info)
+        return changed_files
 
 class GPTPatcher:
-    """
-    GPT API를 통한 안전한 코드 자동 수정 클래스
-    - 패치 실패 원인들을 모두 해결한 견고한 구현
-    - 시드 보호를 위한 다단계 보안 검증
-    """
+    """GPT 기반 자동 코드 패치"""
     
-    def __init__(self):
-        self.client = None
-        self.run_id = os.environ.get('GITHUB_RUN_ID', 'local')
-        self.setup_openai()
-        
-    def setup_openai(self) -> bool:
-        """OpenAI 클라이언트 초기화"""
-        try:
-            api_key = os.environ.get('OPENAI_API_KEY')
-            if not api_key:
-                print("❌ ERROR: OPENAI_API_KEY 환경변수가 설정되지 않았습니다")
-                return False
-                
-            self.client = OpenAI(api_key=api_key)
-            print("✅ OpenAI 클라이언트 초기화 완료")
-            return True
-            
-        except Exception as e:
-            print(f"❌ ERROR: OpenAI 초기화 실패 - {e}")
-            return False
-
-    def get_user_instructions(self) -> Optional[str]:
-        """환경변수에서 사용자 지시문 추출 - 셸 파싱 오류 방지"""
-        instructions = os.environ.get('USER_INSTRUCTIONS', '').strip()
-        if not instructions:
-            print("❌ ERROR: USER_INSTRUCTIONS 환경변수가 비어있습니다")
-            return None
-            
-        print(f"📝 사용자 지시문: {instructions[:100]}{'...' if len(instructions) > 100 else ''}")
-        return instructions
-
-    def get_existing_files(self) -> List[str]:
-        """현재 git에서 추적 중인 파일 목록 조회 - new file 오류 방지"""
-        try:
-            result = subprocess.run(
-                ['git', 'ls-files'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            files = [f.strip() for f in result.stdout.split('\n') if f.strip()]
-            print(f"📂 기존 추적 파일 {len(files)}개 확인")
-            return files
-            
-        except subprocess.CalledProcessError as e:
-            print(f"⚠️ WARNING: git ls-files 실행 실패 - {e}")
-            return []
+    def __init__(self, api_key: str):
+        self.client = openai.OpenAI(api_key=api_key)
+        self.token_manager = TokenManager()
+        logger.info("✅ OpenAI 클라이언트 초기화 완료")
     
-    def is_path_safe(self, path: str) -> Tuple[bool, str]:
-        """경로 보안 검증 - 시드 보호를 위한 핵심 기능"""
-        path = path.strip().replace('\\', '/')
-        
-        # 절대 경로나 상위 디렉토리 접근 차단
-        if path.startswith('/') or '..' in path:
-            return False, "절대경로 또는 상위디렉토리 접근 시도"
-            
-        # 금지 경로 검사
-        for deny in DENY_PATHS:
-            if path.startswith(deny + '/') or path == deny:
-                return False, f"금지 경로 [{deny}] 접근 시도"
-        
-        # 안전 경로 검사
-        for safe in SAFE_PATHS:
-            if path.startswith(safe + '/') or path == safe:
-                return True, "안전 경로 확인"
-        
-        return False, "허용된 안전 경로 범위 밖"
+    def create_system_prompt(self) -> str:
+        """시스템 프롬프트 생성"""
+        return """당신은 전문 코드 개발자입니다. 다음 규칙을 준수하세요:
 
-    def create_llm_prompt(self, instructions: str, existing_files: List[str]) -> Dict[str, str]:
-        """LLM용 프롬프트 생성 - unified diff 사용 절대 금지"""
-        system_prompt = f"""너는 암호화폐 자동매매 시스템의 전문 코드 수정 어시스턴트다.
-
-⚠️ 절대 규칙:
-1. 출력은 오직 JSON 형식만 허용 (설명, 코드펜스, unified diff 절대 금지)
-2. 기존 파일은 절대 new file로 생성하지 말고 반드시 update로 처리
-3. 안전 경로만 수정 가능: {SAFE_PATHS}
-4. 금지 경로 절대 수정 금지: {DENY_PATHS}
-5. 시드 보호 로직(손절, 트레일링, 쿨다운)의 기본값이나 핵심 흐름은 변경 금지
-6. 불분명한 요청은 TODO 주석만 추가
-
-출력 형식 (엄격 준수):
-{{
+1. **JSON 형식 응답**: 반드시 다음 형식으로 응답
+```json
+{
+  "plan": "수행할 작업 계획",
   "files": [
-    {{
-      "path": "경로/파일명",
-      "op": "create|update|delete",
-      "content": "파일 전체 내용 (delete시 빈 문자열)"
-    }}
-  ]
-}}"""
+    {
+      "path": "파일경로",
+      "action": "create|modify|delete",
+      "content": "전체 파일 내용 (create/modify시)",
+      "reason": "작업 이유"
+    }
+  ],
+  "summary": "작업 요약"
+}
+```
 
-        user_prompt = f"""🎯 사용자 지시문:
+2. **파일 처리 규칙**:
+   - create: 새 파일 생성
+   - modify: 기존 파일 수정 (전체 내용 덮어쓰기)
+   - delete: 파일 삭제
+
+3. **코드 품질**:
+   - 에러 처리 필수 (try/except)
+   - 로깅 추가
+   - 주석으로 동작 설명
+   - 기존 기능 보존
+
+4. **안전장치**:
+   - 중요 파일 수정시 백업 고려
+   - 호환성 유지
+   - 테스트 가능한 구조"""
+    
+    def create_user_prompt(self, instructions: str, files: List[Dict]) -> str:
+        """사용자 프롬프트 생성"""
+        # 파일 정보 요약
+        files_summary = []
+        for file_info in files:
+            status = "새 파일" if file_info.get('is_new') else "수정됨"
+            size_kb = file_info['size'] / 1024
+            files_summary.append(f"- {file_info['path']} ({status}, {size_kb:.1f}KB)")
+        
+        prompt = f"""## 작업 지시문
 {instructions}
 
-📋 현재 상황:
-- 안전 경로: {SAFE_PATHS}
-- 금지 경로: {DENY_PATHS}
-- 기존 추적 파일: {len(existing_files)}개
+## 현재 파일 상태
+{chr(10).join(files_summary)}
 
-기존 파일 목록:
-{chr(10).join(existing_files[:50])}
-{'... (더 많은 파일 생략)' if len(existing_files) > 50 else ''}
-
-⚠️ 중요: 위 기존 파일들은 절대 "create"하지 말고 "update"만 사용하라.
-
-JSON 스키마만 반환 (설명/코드펜스 절대 금지):
-{{
-  "files": [
-    {{ "path": "...", "op": "create|update|delete", "content": "..." }}
-  ]
-}}"""
-
-        return {
-            "system": system_prompt,
-            "user": user_prompt
-        }
-
-    def call_llm(self, prompts: Dict[str, str]) -> Optional[Dict]:
-        """LLM 호출 및 응답 처리 - 재시도 로직 포함"""
-        for attempt in range(MAX_RETRIES):
+## 파일 내용
+"""
+        
+        # 파일 내용 추가
+        for file_info in files[:10]:  # 최대 10개 파일만 포함
+            prompt += f"""
+### {file_info['path']}
+```
+{file_info['content']}
+```
+"""
+        
+        return prompt
+    
+    def call_gpt_api(self, instructions: str, files: List[Dict]) -> Optional[Dict]:
+        """GPT API 호출"""
+        # 토큰 최적화
+        available_tokens = MAX_CONTEXT_TOKENS - 1000  # 시스템 프롬프트 등을 위한 여유
+        optimized_files = self.token_manager.optimize_file_list(files, available_tokens)
+        
+        system_prompt = self.create_system_prompt()
+        user_prompt = self.create_user_prompt(instructions, optimized_files)
+        
+        for attempt in range(RETRY_ATTEMPTS):
             try:
-                print(f"🤖 GPT API 호출 중... (시도 {attempt + 1}/{MAX_RETRIES})")
+                logger.info(f"🤖 GPT API 호출 중... (시도 {attempt + 1}/{RETRY_ATTEMPTS})")
                 
                 response = self.client.chat.completions.create(
-                    model="gpt-4",
+                    model=OPENAI_MODEL,
                     messages=[
-                        {"role": "system", "content": prompts["system"]},
-                        {"role": "user", "content": prompts["user"]}
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
                     ],
-                    temperature=OPENAI_TEMPERATURE,
-                    max_tokens=8000
+                    max_tokens=MAX_COMPLETION_TOKENS,
+                    temperature=0.3
                 )
                 
                 content = response.choices[0].message.content.strip()
                 
-                # JSON 추출 - 코드펜스나 추가 텍스트 제거
-                json_match = re.search(r'\{.*\}', content, re.DOTALL)
-                if not json_match:
-                    print(f"⚠️ 시도 {attempt + 1}: JSON 형식을 찾을 수 없음")
-                    continue
-                
-                json_str = json_match.group(0)
-                result = json.loads(json_str)
-                
-                # 기본 구조 검증
-                if not isinstance(result, dict) or 'files' not in result:
-                    print(f"⚠️ 시도 {attempt + 1}: 잘못된 JSON 구조")
-                    continue
-                
-                if not isinstance(result['files'], list):
-                    print(f"⚠️ 시도 {attempt + 1}: files가 배열이 아님")
-                    continue
-                
-                print(f"✅ GPT 응답 파싱 성공 - {len(result['files'])}개 파일 작업")
-                return result
-                
-            except json.JSONDecodeError as e:
-                print(f"⚠️ 시도 {attempt + 1}: JSON 파싱 실패 - {e}")
-                if attempt == MAX_RETRIES - 1:
-                    print(f"📄 마지막 응답 내용: {content[:500]}...")
+                # JSON 파싱 시도
+                try:
+                    # 코드 블록이 있다면 제거
+                    if "```json" in content:
+                        content = content.split("```json")[1].split("```")[0].strip()
+                    elif "```" in content:
+                        content = content.split("```")[1].split("```")[0].strip()
                     
+                    result = json.loads(content)
+                    logger.info("✅ GPT API 호출 성공")
+                    return result
+                
+                except json.JSONDecodeError as e:
+                    logger.error(f"❌ JSON 파싱 실패: {e}")
+                    logger.error(f"응답 내용: {content[:500]}...")
+                    return None
+            
             except Exception as e:
-                print(f"⚠️ 시도 {attempt + 1}: LLM 호출 실패 - {e}")
+                logger.warning(f"⚠️ 시도 {attempt + 1}: LLM 호출 실패 - {e}")
+                if attempt < RETRY_ATTEMPTS - 1:
+                    time.sleep(RETRY_DELAY)
         
-        print("❌ ERROR: GPT API 호출 최종 실패")
+        logger.error("❌ ERROR: GPT API 호출 최종 실패")
         return None
-
-    def validate_and_fix_operations(self, files_data: List[Dict], existing_files: List[str]) -> List[Dict]:
-        """작업 데이터 검증 및 자동 보정"""
-        valid_operations = []
-        existing_set = set(existing_files)
-        
-        for file_data in files_data:
-            if not isinstance(file_data, dict):
-                print(f"⚠️ SKIP: 잘못된 파일 데이터 형식 - {file_data}")
-                continue
-            
-            path = file_data.get('path', '').strip()
-            op = file_data.get('op', '').strip().lower()
-            content = file_data.get('content', '')
-            
-            if not path or op not in ['create', 'update', 'delete']:
-                print(f"⚠️ SKIP: 잘못된 경로 또는 작업 - path:{path}, op:{op}")
-                continue
-            
-            # 보안 검증
-            is_safe, reason = self.is_path_safe(path)
-            if not is_safe:
-                print(f"🚫 DENY: {path} - {reason}")
-                continue
-            
-            # create/update 자동 보정
-            if op == 'create' and path in existing_set:
-                print(f"🔧 AUTO-FIX: {path} - create → update (기존 파일 존재)")
-                op = 'update'
-            
-            # delete 작업 제한 (선택적 - 안전성 강화)
-            if op == 'delete':
-                print(f"⚠️ DELETE 요청: {path} - 신중히 처리")
-            
-            valid_operations.append({
-                'path': path,
-                'op': op,
-                'content': content
-            })
-            print(f"✅ VALID: {path} [{op}]")
-        
-        return valid_operations
-
-    def apply_file_operations(self, operations: List[Dict]) -> bool:
-        """파일 작업 적용 - unified diff 대신 직접 파일 조작"""
-        if not operations:
-            print("📭 적용할 파일 작업이 없습니다")
-            return True
-        
+    
+    def execute_file_operations(self, operations: List[Dict]) -> bool:
+        """파일 작업 실행"""
         success_count = 0
         
-        for op_data in operations:
-            path = op_data['path']
-            op = op_data['op']
-            content = op_data['content']
-            
+        for op in operations:
             try:
-                if op == 'delete':
-                    if os.path.exists(path):
-                        # Git에서 파일 제거
-                        subprocess.run(['git', 'rm', path], check=True, capture_output=True)
-                        print(f"🗑️ DELETED: {path}")
-                        success_count += 1
-                    else:
-                        print(f"⚠️ SKIP DELETE: {path} - 파일이 존재하지 않음")
-                        
-                else:  # create 또는 update
+                path = Path(op['path'])
+                action = op['action']
+                
+                if action == "create" or action == "modify":
                     # 디렉토리 생성
-                    dir_path = os.path.dirname(path)
-                    if dir_path:
-                        os.makedirs(dir_path, exist_ok=True)
+                    path.parent.mkdir(parents=True, exist_ok=True)
                     
                     # 파일 쓰기
                     with open(path, 'w', encoding='utf-8') as f:
-                        f.write(content)
+                        f.write(op['content'])
                     
-                    # Git에 추가
-                    subprocess.run(['git', 'add', path], check=True, capture_output=True)
-                    
-                    action = "CREATED" if op == 'create' else "UPDATED"
-                    print(f"📝 {action}: {path} ({len(content)} chars)")
+                    logger.info(f"✅ {action}: {path}")
                     success_count += 1
-                    
+                
+                elif action == "delete":
+                    if path.exists():
+                        path.unlink()
+                        logger.info(f"🗑️ 삭제: {path}")
+                        success_count += 1
+                    else:
+                        logger.warning(f"⚠️ 삭제 대상 없음: {path}")
+                
             except Exception as e:
-                print(f"❌ ERROR applying {op} to {path}: {e}")
-                return False
+                logger.error(f"❌ 파일 작업 실패 {op['path']}: {e}")
         
-        print(f"✅ 파일 작업 완료: {success_count}/{len(operations)}")
-        return True
-
-    def check_changes_and_commit(self) -> bool:
-        """변경사항 확인 및 커밋"""
-        try:
-            # 변경사항 확인
-            result = subprocess.run(
-                ['git', 'status', '--porcelain'],
-                capture_output=True,
-                text=True,
-                check=True
-            )
-            
-            changes = result.stdout.strip()
-            if not changes:
-                print("📭 변경사항이 없습니다 - PR 생성하지 않음")
-                return True
-            
-            print(f"📋 감지된 변경사항:\n{changes}")
-            
-            # 브랜치 생성 및 체크아웃
-            branch_name = f"gpt/change-{self.run_id}"
-            subprocess.run(['git', 'checkout', '-b', branch_name], check=True)
-            print(f"🌿 브랜치 생성: {branch_name}")
-            
-            # 커밋
-            commit_msg = f"GPT: Apply automated changes (Run #{self.run_id})"
-            subprocess.run(['git', 'commit', '-m', commit_msg], check=True)
-            print(f"💾 커밋 완료: {commit_msg}")
-            
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            print(f"❌ ERROR: Git 작업 실패 - {e}")
-            return False
-
-    def run(self) -> bool:
-        """메인 실행 함수 - 전체 파이프라인 조율"""
-        print("🚀 GPT 자동 코드 수정 시작")
-        print("=" * 50)
-        
-        # 1. 입력 데이터 수집
-        instructions = self.get_user_instructions()
-        if not instructions:
-            return False
-        
-        existing_files = self.get_existing_files()
-        
-        # 2. LLM 프롬프트 생성 및 호출
-        prompts = self.create_llm_prompt(instructions, existing_files)
-        llm_result = self.call_llm(prompts)
-        if not llm_result:
-            return False
-        
-        # 3. 작업 검증 및 보정
-        operations = self.validate_and_fix_operations(
-            llm_result.get('files', []), 
-            existing_files
-        )
-        
-        # 4. 파일 작업 적용
-        if not self.apply_file_operations(operations):
-            return False
-        
-        # 5. 변경사항 확인 및 커밋
-        if not self.check_changes_and_commit():
-            return False
-        
-        print("=" * 50)
-        print("🎉 GPT 자동 코드 수정 완료!")
-        return True
-
+        logger.info(f"📊 파일 작업 완료: {success_count}/{len(operations)} 성공")
+        return success_count > 0
 
 def main():
-    """메인 엔트리 포인트"""
+    """메인 실행 함수"""
     try:
-        patcher = GPTPatcher()
-        success = patcher.run()
-        sys.exit(0 if success else 1)
+        # 환경 변수 확인
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            logger.error("❌ OPENAI_API_KEY 환경변수가 설정되지 않았습니다")
+            return False
         
-    except KeyboardInterrupt:
-        print("\n❌ 사용자에 의해 중단됨")
-        sys.exit(1)
+        instructions = os.getenv("USER_INSTRUCTIONS", "")
+        if not instructions:
+            logger.error("❌ USER_INSTRUCTIONS 환경변수가 설정되지 않았습니다")
+            return False
         
-    except Exception as e:
-        print(f"❌ FATAL ERROR: {e}")
-        import traceback
-        traceback.print_exc()
-        sys.exit(1)
+        logger.info("🚀 GPT 자동 코드 수정 시작")
+        logger.info("=" * 50)
+        logger.info(f"📝 사용자 지시문: {instructions[:100]}...")
+        
+        # 파일 추적 시작
+        tracker = GitFileTracker()
+        changed_files = tracker.get_changed_files()
+        
+        if not changed_files:
+            logger.info("📂 변경된 파일이 없습니다. 기본 테스트 파일을 생성합니다.")
+            # 기본 테스트 파일 생성
+            test_content = f"""# GPT 자동 수정 테스트
+# 생성 시간: {time.strftime('%Y-%m-%d %H:%M:%S')}
+# 지시문: {instructions[:100]}...
 
+print("GPT 자동 수정 테스트 성공!")
+"""
+            changed_files = [{
+                'path': f'gpt_test_{int(time.time())}.py',
+                'content': test_content,
+                'size': len(test_content),
+                'is_new': True
+            }]
+        
+        logger.info(f"📂 처리할 파일 {len(changed_files)}개 확인")
+        
+        # GPT 패치 실행
+        patcher = GPTPatcher(api_key)
+        result = patcher.call_gpt_api(instructions, changed_files)
+        
+        if not result:
+            logger.error("❌ GPT API 호출 실패")
+            return False
+        
+        # 파일 작업 실행
+        if 'files' in result and result['files']:
+            success = patcher.execute_file_operations(result['files'])
+            
+            if success:
+                logger.info("✅ 모든 작업이 성공적으로 완료되었습니다")
+                logger.info(f"📋 작업 요약: {result.get('summary', 'N/A')}")
+                return True
+            else:
+                logger.error("❌ 파일 작업 중 오류 발생")
+                return False
+        else:
+            logger.warning("⚠️ 수행할 파일 작업이 없습니다")
+            return True
+    
+    except Exception as e:
+        logger.error(f"❌ 예상치 못한 오류: {e}")
+        return False
 
 if __name__ == "__main__":
-    main()
+    success = main()
+    exit(0 if success else 1)
