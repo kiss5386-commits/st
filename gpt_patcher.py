@@ -1,4 +1,16 @@
-#!/usr/bin/env python3
+@staticmethod
+    def truncate_content(content: str, max_tokens: int) -> str:
+        """컨텐츠를 토큰 제한에 맞게 잘라냄"""
+        estimated_tokens = TokenManager.estimate_tokens(content)
+        if estimated_tokens <= max_tokens:
+            return content
+        
+        # 대략적 비율로 잘라내기
+        ratio = max_tokens / estimated_tokens
+        truncate_length = int(len(content) * ratio * 0.9)  # 안전 마진
+        
+        truncated = content[:truncate_length]
+        return truncated + "\n\n[... 내용이 길어 일부 생략됨 ...]"#!/usr/bin/env python3
 """
 GPT 자동 코드 패치 도구 - 개선된 토큰 관리 버전
 컨텍스트 길이 초과 문제를 해결하고 대용량 파일 처리 능력 강화
@@ -61,44 +73,163 @@ class TokenManager:
         return len(text) // 3  # 보수적 추정
     
     @staticmethod
-    def truncate_content(content: str, max_tokens: int) -> str:
-        """컨텐츠를 토큰 제한에 맞게 잘라냄"""
-        estimated_tokens = TokenManager.estimate_tokens(content)
-        if estimated_tokens <= max_tokens:
-            return content
+    def extract_code_structure(content: str, max_tokens: int) -> str:
+        """대용량 코드에서 핵심 구조만 추출"""
+        lines = content.split('\n')
+        extracted_lines = []
+        current_tokens = 0
         
-        # 대략적 비율로 잘라내기
-        ratio = max_tokens / estimated_tokens
-        truncate_length = int(len(content) * ratio * 0.9)  # 안전 마진
+        # 우선순위별 추출
+        priorities = [
+            # 1순위: 클래스/함수 정의
+            (r'^class\s+\w+', '클래스 정의'),
+            (r'^def\s+\w+', '함수 정의'),
+            (r'^\s+def\s+\w+', '메서드 정의'),
+            # 2순위: 중요 설정/상수
+            (r'^[A-Z_]+=', '상수 정의'),
+            (r'^import\s+|^from\s+', '임포트'),
+            # 3순위: 주석과 독스트링
+            (r'^\s*"""', '독스트링'),
+            (r'^\s*#.*중요|^\s*#.*TODO|^\s*#.*FIXME', '중요 주석'),
+        ]
         
-        truncated = content[:truncate_length]
-        return truncated + "\n\n[... 내용이 길어 일부 생략됨 ...]"
+        import re
+        
+        # 우선순위별 추출
+        for pattern, desc in priorities:
+            if current_tokens >= max_tokens * 0.9:
+                break
+                
+            for i, line in enumerate(lines):
+                if re.match(pattern, line):
+                    # 함수/클래스의 경우 시그니처와 독스트링 포함
+                    if 'def ' in line or 'class ' in line:
+                        block = TokenManager.extract_function_block(lines, i)
+                        block_tokens = TokenManager.estimate_tokens('\n'.join(block))
+                        
+                        if current_tokens + block_tokens <= max_tokens:
+                            extracted_lines.extend(block)
+                            current_tokens += block_tokens
+                    else:
+                        line_tokens = TokenManager.estimate_tokens(line)
+                        if current_tokens + line_tokens <= max_tokens:
+                            extracted_lines.append(line)
+                            current_tokens += line_tokens
+        
+        if not extracted_lines:
+            # 구조 추출 실패시 앞부분만
+            truncated = TokenManager.truncate_content(content, max_tokens)
+            return truncated
+        
+        result = '\n'.join(extracted_lines)
+        result += f"\n\n# ... 총 {len(lines)}줄 중 핵심 구조 {len(extracted_lines)}줄 추출됨 ..."
+        return result
+    
+    @staticmethod
+    def extract_function_block(lines: List[str], start_idx: int) -> List[str]:
+        """함수/클래스 블록 추출 (시그니처 + 독스트링만)"""
+        block = [lines[start_idx]]  # 함수/클래스 정의 라인
+        
+        i = start_idx + 1
+        indent_level = len(lines[start_idx]) - len(lines[start_idx].lstrip())
+        
+        # 독스트링이나 주요 주석만 포함
+        in_docstring = False
+        docstring_quotes = None
+        
+        while i < len(lines) and i < start_idx + 20:  # 최대 20줄까지만
+            line = lines[i]
+            
+            if not line.strip():  # 빈 줄
+                block.append(line)
+                i += 1
+                continue
+                
+            line_indent = len(line) - len(line.lstrip())
+            
+            # 들여쓰기가 원래보다 작거나 같으면 함수 끝
+            if line_indent <= indent_level and line.strip():
+                break
+            
+            # 독스트링 처리
+            if '"""' in line or "'''" in line:
+                if not in_docstring:
+                    docstring_quotes = '"""' if '"""' in line else "'''"
+                    in_docstring = True
+                    block.append(line)
+                elif docstring_quotes in line:
+                    block.append(line)
+                    in_docstring = False
+                    break  # 독스트링 끝나면 함수 시그니처 완료
+                else:
+                    block.append(line)
+            elif in_docstring:
+                block.append(line)
+            elif line.strip().startswith('#'):  # 주석
+                block.append(line)
+            elif 'return ' in line or 'yield ' in line:  # 반환 타입 힌트
+                block.append(line)
+                break
+            
+            i += 1
+        
+        # 함수 본문 생략 표시
+        if i < len(lines) and i > start_idx + 1:
+            block.append(" " * (indent_level + 4) + "# ... 함수 본문 생략 ...")
+            
+        return block
     
     @staticmethod
     def optimize_file_list(files: List[Dict], max_tokens: int) -> List[Dict]:
-        """파일 목록을 토큰 제한에 맞게 최적화"""
+        """파일 목록을 토큰 제한에 맞게 최적화 - 대용량 단일파일 지원"""
         total_tokens = 0
         optimized_files = []
         
-        # 작은 파일부터 우선 처리
-        sorted_files = sorted(files, key=lambda f: len(f.get('content', '')))
+        # 우선순위: .py 파일 먼저, 그 다음 크기순
+        def file_priority(f):
+            path = f.get('path', '')
+            if 'stargate' in path and path.endswith('.py'):
+                return 0  # 최고 우선순위
+            elif path.endswith('.py'):
+                return 1
+            else:
+                return 2
+        
+        sorted_files = sorted(files, key=lambda f: (file_priority(f), len(f.get('content', ''))))
         
         for file_info in sorted_files:
             content = file_info.get('content', '')
             file_tokens = TokenManager.estimate_tokens(content)
+            path = file_info.get('path', '')
             
-            if total_tokens + file_tokens > max_tokens:
-                # 남은 토큰으로 파일 내용 축약
+            # 대용량 단일 파일 특별 처리
+            if file_tokens > max_tokens * 0.8:  # 전체 토큰의 80% 이상
+                logger.info(f"🔥 대용량 파일 감지: {path} ({file_tokens:,} 토큰)")
+                
+                # 핵심 부분만 추출 (함수 시그니처, 클래스 정의, 주요 로직)
+                optimized_content = TokenManager.extract_code_structure(content, max_tokens)
+                file_info['content'] = optimized_content
+                file_info['is_large_file'] = True
+                optimized_files.append(file_info)
+                total_tokens += TokenManager.estimate_tokens(optimized_content)
+                
+                logger.info(f"📝 대용량 파일 최적화: {file_tokens:,} → {TokenManager.estimate_tokens(optimized_content):,} 토큰")
+                break  # 대용량 파일 하나만 처리
+            
+            # 일반 파일 처리
+            elif total_tokens + file_tokens <= max_tokens:
+                optimized_files.append(file_info)
+                total_tokens += file_tokens
+            else:
+                # 남은 공간으로 축약
                 remaining_tokens = max_tokens - total_tokens
-                if remaining_tokens > 100:  # 최소 100토큰은 있어야 의미있음
+                if remaining_tokens > 500:  # 최소 500토큰
                     file_info['content'] = TokenManager.truncate_content(content, remaining_tokens)
                     optimized_files.append(file_info)
+                    total_tokens = max_tokens
                 break
-            
-            optimized_files.append(file_info)
-            total_tokens += file_tokens
         
-        logger.info(f"📊 파일 최적화: {len(files)} → {len(optimized_files)}개, 예상 토큰: {total_tokens}")
+        logger.info(f"📊 파일 최적화: {len(files)} → {len(optimized_files)}개, 예상 토큰: {total_tokens:,}")
         return optimized_files
 
 class GitFileTracker:
