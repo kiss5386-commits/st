@@ -1,3 +1,24 @@
+# === GPT PATCH HELPER: BEGIN ===
+def _as_bool(v, default=True):
+    if v is None: return default
+    if isinstance(v, bool): return v
+    return str(v).strip().lower() in ("1","true","yes","y","on")
+
+def trailing_enabled_from_cfg(cfg):
+    try:
+        if isinstance(cfg, dict):
+            if "enable_trailing" in cfg:
+                return _as_bool(cfg.get("enable_trailing"), True)
+            if "trailing_enabled" in cfg:
+                return _as_bool(cfg.get("trailing_enabled"), True)
+            t = cfg.get("trailing") or {}
+            if isinstance(t, dict) and "enabled" in t:
+                return _as_bool(t.get("enabled"), True)
+        return True
+    except Exception:
+        return True
+# === GPT PATCH HELPER: END ===
+
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
@@ -4290,6 +4311,7 @@ def server_main(config_dict: Dict[str, Any], stop_event: mp.Event, log_queue: mp
 
         @app.route("/webhook", methods=["POST"])
         def webhook():
+    reverse_on_opposite = (not trailing_enabled_from_cfg(locals().get('cfg', locals().get('settings', {}))))  # GPT PATCH: trailing OFF => reverse
             """웹훅 엔드포인트"""
             try:
                 # IP 화이트리스트 검증
