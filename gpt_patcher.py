@@ -10,6 +10,25 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 import openai
 
+def parse_direct_plan_from_instructions(instr: str):
+    """USER_INSTRUCTIONS가 JSON 계획일 경우 그대로 파싱해서 돌리는 빠른 경로"""
+    try:
+        s = (instr or "").strip()
+        # 코드펜스가 섞여 들어온 경우 대비
+        if s.startswith("```"):
+            if "```json" in s:
+                s = s.split("```json", 1)[1].split("```", 1)[0]
+            else:
+                s = s.split("```", 1)[1].split("```", 1)[0]
+            s = s.strip()
+        plan = json.loads(s)
+        if isinstance(plan, dict) and "files" in plan:
+            return plan
+    except Exception:
+        pass
+    return None
+
+
 # ===== 설정 =====
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5-mini")  # 환경변수로 모델 선택
 MAX_CONTEXT_TOKENS = 200000     # GPT-5 기준 대용량 컨텍스트
@@ -516,6 +535,23 @@ def main():
         if not instructions:
             logger.error("❌ USER_INSTRUCTIONS 환경변수가 설정되지 않았습니다")
             return False
+
+        direct_plan = parse_direct_plan_from_instructions(instructions)
+        if direct_plan:
+            logger.info("🛠 Direct JSON plan detected — skipping GPT call.")
+            patcher = GPTPatcher(api_key)  # openai는 쓰지 않지만 그대로 사용
+            ops = direct_plan.get("files", [])
+            if not ops:
+                logger.warning("⚠️ 실행할 파일 작업이 없습니다(direct plan).")
+                return True
+            success = patcher.execute_file_operations(ops)
+            if success:
+                logger.info("✅ Direct plan applied successfully")
+                logger.info(f"📋 작업 요약: {direct_plan.get('summary', 'N/A')}")
+                return True
+            else:
+                logger.error("❌ 파일 작업 실패(direct plan)")
+                return False
         
         logger.info("🚀 GPT 자동 코드 수정 시작")
         logger.info("=" * 50)
