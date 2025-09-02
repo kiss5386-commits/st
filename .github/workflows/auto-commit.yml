@@ -114,6 +114,7 @@ jobs:
 
             # dry-run 검사
             pathlib.Path(".gpt_patch.diff").write_text(patch, encoding="utf-8")
+            ensure_dirs_for_patch(patch)  # ← 이 줄 추가
             subprocess.check_call(["git","apply","--check",".gpt_patch.diff"])
             print("DRY-RUN OK")
 
