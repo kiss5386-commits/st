@@ -1,32 +1,14 @@
-name: GPT Auto Code Modification
+﻿name: GPT Auto Code Modification
 
 on:
+  push:
+    branches: [main]
+    paths:
+      - "st/**"
+      - "**/*.py"
   workflow_dispatch:
-    inputs:
-      instructions:
-        description: '한글 지시문 (코드 수정 내용)'
-        required: true
-        type: string
-      model:
-        description: 'OpenAI 모델 선택'
-        required: false
-        default: 'gpt-5-mini'
-        type: choice
-        options:
-          - 'gpt-5'
-          - 'gpt-5-mini'
-          - 'gpt-5-nano'
-          - 'gpt-4o'
-          - 'gpt-4o-mini'
-          - 'o1-preview'
-          - 'o1-mini'
-      max_files:
-        description: '최대 처리 파일 수'
-        required: false
-        default: '10'
-        type: string
-
-permissions:
+  repository_dispatch:
+    types: [run_modify_bot]permissions:
   contents: write
   pull-requests: write
 
@@ -34,9 +16,9 @@ jobs:
   auto-modify:
     runs-on: ubuntu-latest
     env:
-      OPENAI_MODEL: gpt-5-mini   # 모델 고정(기본)
-      MAX_FILES: "1"             # GPT 경로에서 첨부 파일 수 제한
-      TOKEN_BUDGET: "12000"      # GPT 경로 입력 토큰 상한
+      OPENAI_MODEL: gpt-5-mini   # 紐⑤뜽 怨좎젙(湲곕낯)
+      MAX_FILES: "1"             # GPT 寃쎈줈?먯꽌 泥⑤? ?뚯씪 ???쒗븳
+      TOKEN_BUDGET: "12000"      # GPT 寃쎈줈 ?낅젰 ?좏겙 ?곹븳
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -63,7 +45,7 @@ jobs:
         run: |
           git add -A
           git stash push -m "Backup before GPT modification - $(date)" || true
-          echo "🔒 현재 상태 백업 완료"
+          echo "?뵏 ?꾩옱 ?곹깭 諛깆뾽 ?꾨즺"
 
       - name: Python syntax check
         run: python -m py_compile gpt_patcher.py
@@ -72,17 +54,17 @@ jobs:
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           USER_INSTRUCTIONS: ${{ github.event.inputs.instructions }}
-          # 입력값이 비어있으면 job env 기본값 사용
+          # ?낅젰媛믪씠 鍮꾩뼱?덉쑝硫?job env 湲곕낯媛??ъ슜
           OPENAI_MODEL: ${{ github.event.inputs.model || env.OPENAI_MODEL }}
           MAX_FILES: ${{ github.event.inputs.max_files || env.MAX_FILES }}
           GITHUB_RUN_ID: ${{ github.run_id }}
         run: |
-          echo "🚀 GPT 패처 실행 시작"
-          echo "📝 지시문(앞 120자):"
-          printf '%s' "$USER_INSTRUCTIONS" | head -c 120 | sed 's/`/´/g'
+          echo "?? GPT ?⑥쿂 ?ㅽ뻾 ?쒖옉"
+          echo "?뱷 吏?쒕Ц(??120??:"
+          printf '%s' "$USER_INSTRUCTIONS" | head -c 120 | sed 's/`/쨈/g'
           echo
-          echo "🤖 모델: $OPENAI_MODEL"
-          echo "📂 최대 파일: $MAX_FILES"
+          echo "?쨼 紐⑤뜽: $OPENAI_MODEL"
+          echo "?뱛 理쒕? ?뚯씪: $MAX_FILES"
 
           python3 gpt_patcher.py
 
@@ -90,12 +72,12 @@ jobs:
         id: changes
         run: |
           if git diff --quiet && git diff --cached --quiet; then
-            echo "변경사항이 없습니다"
+            echo "蹂寃쎌궗??씠 ?놁뒿?덈떎"
             echo "has_changes=false" >> "$GITHUB_OUTPUT"
           else
-            echo "변경사항이 발견되었습니다"
+            echo "蹂寃쎌궗??씠 諛쒓껄?섏뿀?듬땲??
             echo "has_changes=true" >> "$GITHUB_OUTPUT"
-            echo "📋 변경된 파일:"
+            echo "?뱥 蹂寃쎈맂 ?뚯씪:"
             git diff --name-status || true
             git diff --cached --name-status || true
           fi
@@ -110,13 +92,13 @@ jobs:
 
           git add -A
 
-          # 변경 없으면 스킵
+          # 蹂寃??놁쑝硫??ㅽ궢
           if git diff --cached --quiet; then
             echo "No changes to commit."
             exit 0
           fi
 
-          # 입력 JSON에서 plan 이름만 안전하게 추출 (jq 없으면 빈값)
+          # ?낅젰 JSON?먯꽌 plan ?대쫫留??덉쟾?섍쾶 異붿텧 (jq ?놁쑝硫?鍮덇컪)
           PLAN_NAME=$(printf '%s' "${{ github.event.inputs.instructions }}" | jq -r '.plan // empty' 2>/dev/null || true)
           [ -z "$PLAN_NAME" ] && PLAN_NAME="apply plan"
 
@@ -133,64 +115,65 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
           branch: gpt/auto-${{ github.run_id }}
-          # 지시문 노출/인젝션 방지를 위해 안전한 제목 사용
+          # 吏?쒕Ц ?몄텧/?몄젥??諛⑹?瑜??꾪빐 ?덉쟾???쒕ぉ ?ъ슜
           title: "gpt-patcher: ${{ github.run_id }}"
 
           body: |
-            ## 🤖 GPT 자동 코드 수정
+            ## ?쨼 GPT ?먮룞 肄붾뱶 ?섏젙
 
-            **⚙️ 설정:**
-            - **모델:** ${{ github.event.inputs.model || env.OPENAI_MODEL }}
-            - **최대 파일:** ${{ github.event.inputs.max_files || env.MAX_FILES }}
+            **?숋툘 ?ㅼ젙:**
+            - **紐⑤뜽:** ${{ github.event.inputs.model || env.OPENAI_MODEL }}
+            - **理쒕? ?뚯씪:** ${{ github.event.inputs.max_files || env.MAX_FILES }}
             - **Run ID:** ${{ github.run_id }}
 
-            **📋 변경사항:**
-            이 PR에는 GPT 패처가 자동으로 생성/수정한 파일들이 포함되어 있습니다.
+            **?뱥 蹂寃쎌궗??**
+            ??PR?먮뒗 GPT ?⑥쿂媛 ?먮룞?쇰줈 ?앹꽦/?섏젙???뚯씪?ㅼ씠 ?ы븿?섏뼱 ?덉뒿?덈떎.
           commit-message: "gpt-patcher: auto"
           delete-branch: true
           assignees: ${{ github.actor }}
           reviewers: ${{ github.actor }}
 
-      - name: Auto-merge PR (선택적)
+      - name: Auto-merge PR (?좏깮??
         if: steps.changes.outputs.has_changes == 'true' && contains(github.event.inputs.instructions, '[AUTO_MERGE]')
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           PR_NUMBER=$(gh pr list --head "gpt/auto-${{ github.run_id }}" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$PR_NUMBER" ] && [ "$PR_NUMBER" != "null" ]; then
-            echo "🔄 PR #$PR_NUMBER 자동 머지 시도"
+            echo "?봽 PR #$PR_NUMBER ?먮룞 癒몄? ?쒕룄"
             sleep 5
             gh pr merge "$PR_NUMBER" --squash --auto || {
-              echo "⚠️ 자동 머지 실패 - 수동 확인 필요"
-              gh pr comment "$PR_NUMBER" --body "⚠️ 자동 머지에 실패했습니다. 코드 리뷰 후 수동으로 머지해주세요."
+              echo "?좑툘 ?먮룞 癒몄? ?ㅽ뙣 - ?섎룞 ?뺤씤 ?꾩슂"
+              gh pr comment "$PR_NUMBER" --body "?좑툘 ?먮룞 癒몄????ㅽ뙣?덉뒿?덈떎. 肄붾뱶 由щ럭 ???섎룞?쇰줈 癒몄??댁＜?몄슂."
             }
-            echo "✅ 자동 머지 처리 완료"
+            echo "???먮룞 癒몄? 泥섎━ ?꾨즺"
           else
-            echo "❌ PR을 찾을 수 없습니다"
+            echo "??PR??李얠쓣 ???놁뒿?덈떎"
           fi
 
       - name: Cleanup on failure
         if: failure()
         run: |
-          echo "💥 작업 실패 - 정리 작업 시작"
-          git stash pop 2>/dev/null || echo "복원할 백업이 없습니다"
+          echo "?뮙 ?묒뾽 ?ㅽ뙣 - ?뺣━ ?묒뾽 ?쒖옉"
+          git stash pop 2>/dev/null || echo "蹂듭썝??諛깆뾽???놁뒿?덈떎"
           git branch -D "gpt/auto-${{ github.run_id }}" 2>/dev/null || true
-          echo "🧹 정리 작업 완료"
+          echo "?㏏ ?뺣━ ?묒뾽 ?꾨즺"
 
       - name: Summary
         if: always()
         run: |
-          echo "📊 GPT 자동 수정 요약"
+          echo "?뱤 GPT ?먮룞 ?섏젙 ?붿빟"
           echo "===================="
-          echo "📝 지시문(앞 120자):"
-          printf '%s' "${{ github.event.inputs.instructions }}" | head -c 120 | sed 's/`/´/g'
+          echo "?뱷 吏?쒕Ц(??120??:"
+          printf '%s' "${{ github.event.inputs.instructions }}" | head -c 120 | sed 's/`/쨈/g'
           echo
-          echo "🤖 모델: ${{ github.event.inputs.model || env.OPENAI_MODEL }}"
-          echo "📂 최대 파일: ${{ github.event.inputs.max_files || env.MAX_FILES }}"
-          echo "🔄 Run ID: ${{ github.run_id }}"
+          echo "?쨼 紐⑤뜽: ${{ github.event.inputs.model || env.OPENAI_MODEL }}"
+          echo "?뱛 理쒕? ?뚯씪: ${{ github.event.inputs.max_files || env.MAX_FILES }}"
+          echo "?봽 Run ID: ${{ github.run_id }}"
           if [ "${{ steps.changes.outputs.has_changes }}" = "true" ]; then
-            echo "✅ 상태: 변경사항 있음 - PR 생성됨"
+            echo "???곹깭: 蹂寃쎌궗???덉쓬 - PR ?앹꽦??
           else
-            echo "ℹ️ 상태: 변경사항 없음"
+            echo "?뱄툘 ?곹깭: 蹂寃쎌궗???놁쓬"
           fi
           echo "===================="
+

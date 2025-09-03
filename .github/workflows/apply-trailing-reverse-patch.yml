@@ -1,7 +1,13 @@
-name: apply-trailing-reverse-patch
+﻿name: apply-trailing-reverse-patch
 on:
-  workflow_dispatch: {}
-
+  push:
+    branches: [main]
+    paths:
+      - "st/**"
+      - "**/*.py"
+  workflow_dispatch:
+  repository_dispatch:
+    types: [apply_trailing_reverse_patch]
 permissions:
   contents: write
   pull-requests: write
@@ -22,7 +28,7 @@ jobs:
 
           changed = False
 
-          # 0) 헬퍼 보강: _as_bool / trailing_enabled_from_cfg 없으면 주입
+          # 0) ?ы띁 蹂닿컯: _as_bool / trailing_enabled_from_cfg ?놁쑝硫?二쇱엯
           if "def trailing_enabled_from_cfg(" not in s:
             inject = textwrap.dedent("""
             # === GPT PATCH HELPER: BEGIN ===
@@ -46,13 +52,13 @@ jobs:
                     return True
             # === GPT PATCH HELPER: END ===
             """).strip()+"\n\n"
-            # import 아래에 삽입
+            # import ?꾨옒???쎌엯
             m = re.search(r"(?s)^(from .*?\\n|import .*?\\n)+", s)
             pos = m.end() if m else 0
             s = s[:pos] + inject + s[pos:]
             changed = True
 
-          # 1) 맨 아래 fallback 라인 제거 (있으면)
+          # 1) 留??꾨옒 fallback ?쇱씤 ?쒓굅 (?덉쑝硫?
           new_s, n = re.subn(
             r"\\n#\\s*GPT PATCH: fallback definition\\s*\\nreverse_on_opposite\\s*=\\s*\\(not\\s*trailing_enabled_from_cfg\\(globals\\(\\)\\.get\\('cfg',\\s*\\{\\}\\)\\)\\)\\s*\\n\\s*$",
             "\n",
@@ -62,7 +68,7 @@ jobs:
             s = new_s
             changed = True
 
-          # 2) 기존 reverse_on_opposite 대입은 모두 표준식으로 교체
+          # 2) 湲곗〈 reverse_on_opposite ??낆? 紐⑤몢 ?쒖??앹쑝濡?援먯껜
           new_s, n = re.subn(
             r"(?m)^(\s*)reverse_on_opposite\s*=\s*.*$",
             r"\1reverse_on_opposite = (not trailing_enabled_from_cfg(locals().get('cfg', locals().get('settings', {}))))  # GPT PATCH",
@@ -72,8 +78,8 @@ jobs:
             s = new_s
             changed = True
 
-          # 3) /webhook(또는 유사) 함수 내부에 없으면 주입
-          #    우선순위: @app.route('/webhook'...) -> def .*webhook.* -> def .*process.*signal.*
+          # 3) /webhook(?먮뒗 ?좎궗) ?⑥닔 ?대????놁쑝硫?二쇱엯
+          #    ?곗꽑?쒖쐞: @app.route('/webhook'...) -> def .*webhook.* -> def .*process.*signal.*
           patterns = [
             r"(?s)(@app\.route\(\s*['\"]/webhook['\"].*?\)\s*def\s+\w+\s*\(.*?\):\s*\n)",
             r"(?s)(def\s+\w*webhook\w*\s*\(.*?\):\s*\n)",
@@ -87,7 +93,7 @@ jobs:
                 indent = "    "
                 insert_at = m.end()
                 insert_line = indent + "reverse_on_opposite = (not trailing_enabled_from_cfg(locals().get('cfg', locals().get('settings', {}))))  # GPT PATCH: trailing OFF => reverse\n"
-                # 이미 같은 줄이 함수 안에 있으면 중복 삽입 금지
+                # ?대? 媛숈? 以꾩씠 ?⑥닔 ?덉뿉 ?덉쑝硫?以묐났 ?쎌엯 湲덉?
                 body_end = src.find("\ndef ", insert_at)
                 seg = src[insert_at: body_end if body_end!=-1 else None]
                 if "reverse_on_opposite = (not trailing_enabled_from_cfg" not in seg:
@@ -111,8 +117,16 @@ jobs:
         with:
           branch: patch/trailing-reverse-in-function
           commit-message: "server: set reverse_on_opposite inside webhook; remove fallback"
-          title: "patch: 전환 조건을 웹훅 함수 내부에 설정 + fallback 제거"
+          title: "patch: ?꾪솚 議곌굔???뱁썒 ?⑥닔 ?대????ㅼ젙 + fallback ?쒓굅"
           body: |
-            - reverse_on_opposite를 /webhook(또는 신호 처리) 함수 **내부**에서 설정하도록 주입
-            - 맨 아래 fallback 전역 라인 제거
-            - 표준식: `reverse_on_opposite = (not trailing_enabled_from_cfg(locals().get('cfg', locals().get('settings', {}))))`
+            - reverse_on_opposite瑜?/webhook(?먮뒗 ?좏샇 泥섎━) ?⑥닔 **?대?**?먯꽌 ?ㅼ젙?섎룄濡?二쇱엯
+            - 留??꾨옒 fallback ?꾩뿭 ?쇱씤 ?쒓굅
+            - ?쒖??? `reverse_on_opposite = (not trailing_enabled_from_cfg(locals().get('cfg', locals().get('settings', {}))))`
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: apply-trailing-reverse-patch
+  cancel-in-progress: false
