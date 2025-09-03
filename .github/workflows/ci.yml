@@ -1,0 +1,19 @@
+name: CI / sanity
+on:
+  workflow_dispatch: {}     # 수동 실행 가능 (목록에 빨리 뜨게)
+  pull_request:
+  push:
+    branches: [ dev ]       # dev에만 자동, main은 PR에서만 체크
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "CI OK"
