@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
 Stargate Multi-Exchange Trading Server v4.2 - Enhanced Risk Protection System
@@ -4203,7 +4203,69 @@ def server_main(config_dict: Dict[str, Any], stop_event: mp.Event, log_queue: mp
             log_queue.put(f"PUBLIC_URL:{public_url}")
 
         # Flask 앱 생성
-        app = Flask(__name__)
+        $0
+
+# === [SETTINGS API - BEGIN] ===
+# GUI(설정창) ↔ 서버 런타임 동기화 엔드포인트
+import json
+from pathlib import Path
+from flask import jsonify, request
+
+BASE_DIR = Path(__file__).resolve().parent
+SETTINGS_PATH = BASE_DIR / "settings.json"
+
+DEFAULT_SETTINGS = {
+    "trailing_enabled": False,
+    "fixed_stop_pct": 0.01,
+    "trail_trigger_pct": 0.006,
+    "trail_pullback_pct": 0.004,
+    "leverage": 5,
+    "allow_flip_when_trailing_off": True
+}
+
+def _settings_load():
+    if SETTINGS_PATH.exists():
+        try:
+            data = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+            merged = DEFAULT_SETTINGS.copy(); merged.update(data); return merged
+        except Exception as e:
+            try: logger.exception(f"[SETTINGS] load error: {e}")
+            except: pass
+            return DEFAULT_SETTINGS.copy()
+    return DEFAULT_SETTINGS.copy()
+
+def _settings_save(obj: dict):
+    try:
+        SETTINGS_PATH.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception as e:
+        try: logger.exception(f"[SETTINGS] save error: {e}")
+        except: pass
+
+SETTINGS = _settings_load()
+
+def can_flip_on_opposite_signal() -> bool:
+    # 트레일링이 꺼져 있을 때만 반대신호 전환 허용
+    return SETTINGS.get("allow_flip_when_trailing_off", True) and (not SETTINGS.get("trailing_enabled", False))
+
+@app.get("/settings")
+def get_settings():
+    return jsonify(SETTINGS), 200
+
+@app.post("/settings/trailing")
+def api_toggle_trailing():
+    try:
+        data = request.get_json(force=True) or {}
+        enabled = bool(data.get("enabled"))
+        SETTINGS["trailing_enabled"] = enabled
+        _settings_save(SETTINGS)
+        try: logger.info(f"[SETTINGS] trailing_enabled -> {enabled}")
+        except: pass
+        return jsonify({"ok": True, "trailing_enabled": enabled}), 200
+    except Exception as e:
+        try: logger.exception(f"/settings/trailing error: {e}")
+        except: pass
+        return jsonify({"ok": False, "error": str(e)}), 500
+# === [SETTINGS API - END] ===
 
         @app.route("/healthz", methods=["GET"])
         def healthz():
@@ -5415,3 +5477,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
