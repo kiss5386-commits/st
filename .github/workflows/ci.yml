@@ -1,0 +1,19 @@
+name: CI / sanity
+on:
+  pull_request:
+  push:
+    branches: [ main, dev ]   # ← main 포함 (중요)
+  workflow_dispatch: {}
+permissions:
+  contents: read
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - run: echo "CI OK"
